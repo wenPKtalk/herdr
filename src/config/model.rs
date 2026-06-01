@@ -351,6 +351,9 @@ pub struct UiConfig {
     pub toast: ToastConfig,
     /// Play sounds when agents change state in background workspaces.
     pub sound: SoundConfig,
+    /// Show a live preview of the highlighted pane in the session navigator
+    /// (prefix+g), tmux choose-tree style. Default: true.
+    pub navigator_preview: bool,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -505,6 +508,7 @@ impl Default for UiConfig {
             accent: "cyan".into(),
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
+            navigator_preview: true,
         }
     }
 }

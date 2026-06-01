@@ -12,8 +12,13 @@ use super::{
     widgets::{panel_contrast_fg, render_panel_shell},
 };
 use crate::app::state::{AppState, NavigatorRow, NavigatorStateFilter, NavigatorTarget};
+use crate::terminal::TerminalRuntimeRegistry;
 
-pub(super) fn render_navigator_overlay(app: &AppState, frame: &mut Frame) {
+pub(super) fn render_navigator_overlay(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
     let popup = app.navigator_popup_rect();
     let Some(inner) = render_panel_shell(frame, popup, app.palette.accent, app.palette.panel_bg)
     else {
@@ -22,6 +27,7 @@ pub(super) fn render_navigator_overlay(app: &AppState, frame: &mut Frame) {
 
     let search = app.navigator_search_rect();
     let body = app.navigator_body_rect();
+    let preview = app.navigator_preview_rect();
     let detail = app.navigator_detail_rect();
     let footer = app.navigator_footer_rect();
     render_search(app, frame, search);
@@ -30,9 +36,92 @@ pub(super) fn render_navigator_overlay(app: &AppState, frame: &mut Frame) {
         render_separator(frame, Rect::new(inner.x, search.y + 1, inner.width, 1), app);
         render_rows(app, frame, body);
         render_navigator_scrollbar(app, frame, body);
+        if let Some(preview_area) = preview {
+            // 1-col vertical separator between body and preview.
+            let sep_x = body.x + body.width;
+            render_vertical_separator(
+                frame,
+                Rect::new(sep_x, body.y, 1, body.height),
+                app,
+            );
+            render_preview(app, terminal_runtimes, frame, preview_area);
+        }
     }
     render_detail(app, frame, detail);
     render_footer(app, frame, footer);
+}
+
+/// Render the live preview of the currently highlighted navigator row's pane.
+/// For Workspace/Tab targets, previews that scope's focused pane.
+/// Falls back to a centered placeholder when no terminal runtime is available.
+fn render_preview(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let rows = app.navigator_rows();
+    let Some(row) = rows.get(app.navigator.selected) else {
+        render_preview_placeholder(app, frame, area, "no selection");
+        return;
+    };
+    let Some((ws_idx, pane_id)) = preview_target(app, &row.target) else {
+        render_preview_placeholder(app, frame, area, "no pane to preview");
+        return;
+    };
+    match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id) {
+        Some(rt) => rt.render(frame, area, false),
+        None => render_preview_placeholder(app, frame, area, "pane not running"),
+    }
+}
+
+/// Resolve a NavigatorTarget to the (ws_idx, pane_id) we want to preview.
+/// Workspace target → that workspace's focused pane.
+/// Tab target → that tab's focused pane (per its layout).
+/// Pane target → that pane directly.
+fn preview_target(
+    app: &AppState,
+    target: &NavigatorTarget,
+) -> Option<(usize, crate::layout::PaneId)> {
+    match *target {
+        NavigatorTarget::Workspace { ws_idx } => {
+            let pane_id = app.workspaces.get(ws_idx)?.focused_pane_id()?;
+            Some((ws_idx, pane_id))
+        }
+        NavigatorTarget::Tab { ws_idx, tab_idx } => {
+            let pane_id = app
+                .workspaces
+                .get(ws_idx)?
+                .tabs
+                .get(tab_idx)?
+                .layout
+                .focused();
+            Some((ws_idx, pane_id))
+        }
+        NavigatorTarget::Pane {
+            ws_idx, pane_id, ..
+        } => Some((ws_idx, pane_id)),
+    }
+}
+
+fn render_preview_placeholder(app: &AppState, frame: &mut Frame, area: Rect, message: &str) {
+    let p = &app.palette;
+    let line = Line::from(Span::styled(message, Style::default().fg(p.overlay0)));
+    let para = Paragraph::new(line).style(Style::default().fg(p.overlay0));
+    frame.render_widget(Clear, area);
+    frame.render_widget(para, area);
+}
+
+fn render_vertical_separator(frame: &mut Frame, area: Rect, app: &AppState) {
+    let p = &app.palette;
+    let style = Style::default().fg(p.overlay0);
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        if let Some(cell) = buf.cell_mut((area.x, y)) {
+            cell.set_symbol("│");
+            cell.set_style(style);
+        }
+    }
 }
 
 fn render_search(app: &AppState, frame: &mut Frame, area: Rect) {

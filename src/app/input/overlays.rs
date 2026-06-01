@@ -271,17 +271,57 @@ impl AppState {
         Rect::new(inner.x, inner.y, inner.width, inner.height.min(1))
     }
 
+    /// Returns true when the navigator preview pane should be displayed
+    /// alongside the rows list. Requires the config flag AND a wide-enough
+    /// popup (we need ~30 cols on each side to be useful).
+    pub(crate) fn navigator_preview_enabled(&self) -> bool {
+        const MIN_INNER_WIDTH_FOR_PREVIEW: u16 = 60;
+        self.navigator_preview
+            && self.navigator_inner_rect().width >= MIN_INNER_WIDTH_FOR_PREVIEW
+    }
+
     pub(crate) fn navigator_body_rect(&self) -> Rect {
         let inner = self.navigator_inner_rect();
         if inner.height <= 4 {
             return Rect::default();
         }
+        let width = if self.navigator_preview_enabled() {
+            // Left half for the row list; reserve right half + 1-col gap for preview.
+            inner.width / 2
+        } else {
+            inner.width
+        };
         Rect::new(
             inner.x,
             inner.y + 2,
-            inner.width,
+            width,
             inner.height.saturating_sub(4),
         )
+    }
+
+    /// Right-hand preview area, or `None` if preview is disabled / popup too narrow.
+    /// Lives in the same vertical band as `navigator_body_rect`.
+    pub(crate) fn navigator_preview_rect(&self) -> Option<Rect> {
+        if !self.navigator_preview_enabled() {
+            return None;
+        }
+        let inner = self.navigator_inner_rect();
+        if inner.height <= 4 {
+            return None;
+        }
+        let left_width = inner.width / 2;
+        // 1-col gap between list and preview for the vertical separator.
+        let preview_x = inner.x + left_width + 1;
+        let preview_width = inner.width.saturating_sub(left_width + 1);
+        if preview_width < 4 {
+            return None;
+        }
+        Some(Rect::new(
+            preview_x,
+            inner.y + 2,
+            preview_width,
+            inner.height.saturating_sub(4),
+        ))
     }
 
     pub(crate) fn navigator_detail_rect(&self) -> Rect {

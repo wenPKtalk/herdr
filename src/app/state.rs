@@ -1249,6 +1249,9 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
+    /// Show a live preview pane in the session navigator (prefix+g),
+    /// tmux choose-tree style. Lifted from `config.ui.navigator_preview`.
+    pub navigator_preview: bool,
     pub prompt_new_tab_name: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub pane_history_persistence: bool,
@@ -1561,6 +1564,7 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
+            navigator_preview: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
             pane_history_persistence: false,
