@@ -1,8 +1,9 @@
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
+    symbols::border,
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -51,56 +52,96 @@ pub(super) fn render_navigator_overlay(
     render_footer(app, frame, footer);
 }
 
-/// Render the live preview of the currently highlighted navigator row's pane.
-/// For Workspace/Tab targets, previews that scope's focused pane.
-/// Falls back to a centered placeholder when no terminal runtime is available.
+/// Render the live preview of the currently highlighted navigator row.
+///
+/// Mirrors tmux choose-tree's hierarchical behavior:
+///   - Pane row    → that single pane fills the preview area.
+///   - Tab row     → that tab's full pane layout (each pane in its own sub-rect).
+///   - Workspace row → the workspace's active tab's pane layout.
+///
+/// Multi-pane previews draw a thin border around each pane so adjacent panes
+/// don't visually run together.
 fn render_preview(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
 ) {
+    frame.render_widget(Clear, area);
     let rows = app.navigator_rows();
     let Some(row) = rows.get(app.navigator.selected) else {
         render_preview_placeholder(app, frame, area, "no selection");
         return;
     };
-    let Some((ws_idx, pane_id)) = preview_target(app, &row.target) else {
-        render_preview_placeholder(app, frame, area, "no pane to preview");
-        return;
-    };
-    match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id) {
-        Some(rt) => rt.render(frame, area, false),
-        None => render_preview_placeholder(app, frame, area, "pane not running"),
+
+    match row.target {
+        NavigatorTarget::Pane {
+            ws_idx, pane_id, ..
+        } => {
+            match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id) {
+                Some(rt) => rt.render(frame, area, false),
+                None => render_preview_placeholder(app, frame, area, "pane not running"),
+            }
+        }
+        NavigatorTarget::Tab { ws_idx, tab_idx } => {
+            let Some(tab) = app
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(tab_idx))
+            else {
+                render_preview_placeholder(app, frame, area, "tab not found");
+                return;
+            };
+            render_layout_preview(app, terminal_runtimes, frame, area, ws_idx, &tab.layout);
+        }
+        NavigatorTarget::Workspace { ws_idx } => {
+            // Mirror tmux: previewing a session shows its active window's layout.
+            let Some(ws) = app.workspaces.get(ws_idx) else {
+                render_preview_placeholder(app, frame, area, "workspace not found");
+                return;
+            };
+            let Some(tab) = ws.active_tab() else {
+                render_preview_placeholder(app, frame, area, "workspace has no active tab");
+                return;
+            };
+            render_layout_preview(app, terminal_runtimes, frame, area, ws_idx, &tab.layout);
+        }
     }
 }
 
-/// Resolve a NavigatorTarget to the (ws_idx, pane_id) we want to preview.
-/// Workspace target → that workspace's focused pane.
-/// Tab target → that tab's focused pane (per its layout).
-/// Pane target → that pane directly.
-fn preview_target(
+/// Render every pane in `layout` into its slice of `area`. Multi-pane layouts
+/// get a thin border per pane (overlay0 color, plain glyphs) so adjacent panes
+/// are visually distinct without competing with the navigator's accent palette.
+fn render_layout_preview(
     app: &AppState,
-    target: &NavigatorTarget,
-) -> Option<(usize, crate::layout::PaneId)> {
-    match *target {
-        NavigatorTarget::Workspace { ws_idx } => {
-            let pane_id = app.workspaces.get(ws_idx)?.focused_pane_id()?;
-            Some((ws_idx, pane_id))
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+    ws_idx: usize,
+    layout: &crate::layout::TileLayout,
+) {
+    let pane_infos = layout.panes(area);
+    let multi = pane_infos.len() > 1;
+    let border_style = Style::default().fg(app.palette.overlay0);
+    for info in pane_infos {
+        let content_rect = if multi {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .border_set(border::PLAIN);
+            let inner = block.inner(info.rect);
+            frame.render_widget(block, info.rect);
+            inner
+        } else {
+            info.rect
+        };
+        if content_rect.width == 0 || content_rect.height == 0 {
+            continue;
         }
-        NavigatorTarget::Tab { ws_idx, tab_idx } => {
-            let pane_id = app
-                .workspaces
-                .get(ws_idx)?
-                .tabs
-                .get(tab_idx)?
-                .layout
-                .focused();
-            Some((ws_idx, pane_id))
+        match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+            Some(rt) => rt.render(frame, content_rect, false),
+            None => render_preview_placeholder(app, frame, content_rect, "—"),
         }
-        NavigatorTarget::Pane {
-            ws_idx, pane_id, ..
-        } => Some((ws_idx, pane_id)),
     }
 }
 
