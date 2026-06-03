@@ -14,13 +14,22 @@ use super::widgets::{
     modal_stack_areas, panel_contrast_fg, render_action_button, render_modal_header,
     render_modal_shell,
 };
+use crate::app::input::NavigateAction;
 use crate::app::AppState;
 
-pub(super) type HelpEntry = (String, Cow<'static, str>);
+pub(super) type HelpEntry = (String, Cow<'static, str>, Option<NavigateAction>);
 pub(super) type HelpGroup = (&'static str, Vec<HelpEntry>);
 
-fn help_entry(key: impl Into<String>, label: &'static str) -> HelpEntry {
-    (key.into(), Cow::Borrowed(label))
+fn info_entry(key: impl Into<String>, label: &'static str) -> HelpEntry {
+    (key.into(), Cow::Borrowed(label), None)
+}
+
+fn action_entry(
+    key: impl Into<String>,
+    label: &'static str,
+    action: NavigateAction,
+) -> HelpEntry {
+    (key.into(), Cow::Borrowed(label), Some(action))
 }
 
 fn keybind_label(bindings: &crate::config::ActionKeybinds) -> String {
@@ -57,17 +66,26 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     groups.push((
         "global",
         vec![
-            help_entry(
+            info_entry(
                 crate::config::format_key_combo((app.prefix_code, app.prefix_mods)),
                 "prefix mode",
             ),
-            help_entry(keybind_label(&kb.help), "keybinds"),
-            help_entry(keybind_label(&kb.settings), "settings"),
-            help_entry(keybind_label(&kb.detach), "detach"),
-            help_entry(keybind_label(&kb.reload_config), "reload config"),
-            help_entry(
+            action_entry(keybind_label(&kb.help), "keybinds", NavigateAction::Help),
+            action_entry(
+                keybind_label(&kb.settings),
+                "settings",
+                NavigateAction::Settings,
+            ),
+            action_entry(keybind_label(&kb.detach), "detach", NavigateAction::Detach),
+            action_entry(
+                keybind_label(&kb.reload_config),
+                "reload config",
+                NavigateAction::ReloadConfig,
+            ),
+            action_entry(
                 keybind_label(&kb.open_notification_target),
                 "open notification target",
+                NavigateAction::OpenNotificationTarget,
             ),
         ],
     ));
@@ -75,8 +93,8 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     groups.push((
         "navigation",
         vec![
-            help_entry("esc", "back"),
-            help_entry(
+            info_entry("esc", "back"),
+            info_entry(
                 format!(
                     "{} / {}",
                     keybind_label(&kb.navigate.workspace_up),
@@ -84,7 +102,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
                 ),
                 "workspace list",
             ),
-            help_entry(
+            info_entry(
                 format!(
                     "{} / {} / {} / {} / left / right",
                     keybind_label(&kb.navigate.pane_left),
@@ -94,59 +112,177 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
                 ),
                 "move focus",
             ),
-            help_entry("tab / shift+tab", "cycle pane"),
-            help_entry("enter", "open workspace"),
-            help_entry("1..9", "switch workspace"),
+            info_entry("tab / shift+tab", "cycle pane"),
+            info_entry("enter", "open workspace"),
+            info_entry("1..9", "switch workspace"),
         ],
     ));
 
     let workspace_tab = vec![
-        help_entry(keybind_label(&kb.workspace_picker), "workspace navigation"),
-        help_entry(keybind_label(&kb.goto), "session navigator"),
-        help_entry(keybind_label(&kb.new_workspace), "new workspace"),
-        help_entry(keybind_label(&kb.new_worktree), "new worktree"),
-        help_entry(keybind_label(&kb.open_worktree), "open worktree"),
-        help_entry(
+        action_entry(
+            keybind_label(&kb.workspace_picker),
+            "workspace navigation",
+            NavigateAction::WorkspacePicker,
+        ),
+        action_entry(
+            keybind_label(&kb.goto),
+            "session navigator",
+            NavigateAction::OpenNavigator,
+        ),
+        action_entry(
+            keybind_label(&kb.new_workspace),
+            "new workspace",
+            NavigateAction::NewWorkspace,
+        ),
+        action_entry(
+            keybind_label(&kb.new_worktree),
+            "new worktree",
+            NavigateAction::NewWorktree,
+        ),
+        action_entry(
+            keybind_label(&kb.open_worktree),
+            "open worktree",
+            NavigateAction::OpenWorktree,
+        ),
+        action_entry(
             keybind_label(&kb.remove_worktree),
             "delete worktree checkout",
+            NavigateAction::RemoveWorktree,
         ),
-        help_entry(keybind_label(&kb.rename_workspace), "rename workspace"),
-        help_entry(keybind_label(&kb.close_workspace), "close workspace"),
-        help_entry(keybind_label(&kb.previous_workspace), "previous workspace"),
-        help_entry(keybind_label(&kb.next_workspace), "next workspace"),
-        help_entry(indexed_label(&kb.switch_workspace), "switch workspace 1-9"),
-        help_entry(keybind_label(&kb.previous_agent), "previous agent"),
-        help_entry(keybind_label(&kb.next_agent), "next agent"),
-        help_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
-        help_entry(keybind_label(&kb.new_tab), "new tab"),
-        help_entry(keybind_label(&kb.rename_tab), "rename tab"),
-        help_entry(keybind_label(&kb.previous_tab), "previous tab"),
-        help_entry(keybind_label(&kb.next_tab), "next tab"),
-        help_entry(indexed_label(&kb.switch_tab), "switch tab 1-9"),
-        help_entry(keybind_label(&kb.close_tab), "close tab"),
+        action_entry(
+            keybind_label(&kb.rename_workspace),
+            "rename workspace",
+            NavigateAction::RenameWorkspace,
+        ),
+        action_entry(
+            keybind_label(&kb.close_workspace),
+            "close workspace",
+            NavigateAction::CloseWorkspace,
+        ),
+        action_entry(
+            keybind_label(&kb.previous_workspace),
+            "previous workspace",
+            NavigateAction::PreviousWorkspace,
+        ),
+        action_entry(
+            keybind_label(&kb.next_workspace),
+            "next workspace",
+            NavigateAction::NextWorkspace,
+        ),
+        info_entry(indexed_label(&kb.switch_workspace), "switch workspace 1-9"),
+        action_entry(
+            keybind_label(&kb.previous_agent),
+            "previous agent",
+            NavigateAction::PreviousAgent,
+        ),
+        action_entry(
+            keybind_label(&kb.next_agent),
+            "next agent",
+            NavigateAction::NextAgent,
+        ),
+        info_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
+        action_entry(keybind_label(&kb.new_tab), "new tab", NavigateAction::NewTab),
+        action_entry(
+            keybind_label(&kb.rename_tab),
+            "rename tab",
+            NavigateAction::RenameTab,
+        ),
+        action_entry(
+            keybind_label(&kb.previous_tab),
+            "previous tab",
+            NavigateAction::PreviousTab,
+        ),
+        action_entry(
+            keybind_label(&kb.next_tab),
+            "next tab",
+            NavigateAction::NextTab,
+        ),
+        info_entry(indexed_label(&kb.switch_tab), "switch tab 1-9"),
+        action_entry(
+            keybind_label(&kb.close_tab),
+            "close tab",
+            NavigateAction::CloseTab,
+        ),
     ];
     groups.push(("workspaces / tabs", workspace_tab));
 
     let panes = vec![
-        help_entry(keybind_label(&kb.split_vertical), "split vertical"),
-        help_entry(keybind_label(&kb.split_horizontal), "split horizontal"),
-        help_entry(keybind_label(&kb.close_pane), "close pane"),
-        help_entry(keybind_label(&kb.rename_pane), "rename pane"),
-        help_entry(keybind_label(&kb.edit_scrollback), "edit scrollback"),
-        help_entry(keybind_label(&kb.copy_mode), "copy mode"),
-        help_entry(keybind_label(&kb.zoom), "zoom pane"),
-        help_entry(keybind_label(&kb.resize_mode), "resize mode"),
-        help_entry(keybind_label(&kb.toggle_sidebar), "toggle sidebar"),
-        help_entry(keybind_label(&kb.focus_pane_left), "focus pane left"),
-        help_entry(keybind_label(&kb.focus_pane_down), "focus pane down"),
-        help_entry(keybind_label(&kb.focus_pane_up), "focus pane up"),
-        help_entry(keybind_label(&kb.focus_pane_right), "focus pane right"),
-        help_entry(keybind_label(&kb.cycle_pane_next), "cycle pane next"),
-        help_entry(
+        action_entry(
+            keybind_label(&kb.split_vertical),
+            "split vertical",
+            NavigateAction::SplitVertical,
+        ),
+        action_entry(
+            keybind_label(&kb.split_horizontal),
+            "split horizontal",
+            NavigateAction::SplitHorizontal,
+        ),
+        action_entry(
+            keybind_label(&kb.close_pane),
+            "close pane",
+            NavigateAction::ClosePane,
+        ),
+        action_entry(
+            keybind_label(&kb.rename_pane),
+            "rename pane",
+            NavigateAction::RenamePane,
+        ),
+        action_entry(
+            keybind_label(&kb.edit_scrollback),
+            "edit scrollback",
+            NavigateAction::EditScrollback,
+        ),
+        action_entry(
+            keybind_label(&kb.copy_mode),
+            "copy mode",
+            NavigateAction::CopyMode,
+        ),
+        action_entry(keybind_label(&kb.zoom), "zoom pane", NavigateAction::Zoom),
+        action_entry(
+            keybind_label(&kb.resize_mode),
+            "resize mode",
+            NavigateAction::EnterResizeMode,
+        ),
+        action_entry(
+            keybind_label(&kb.toggle_sidebar),
+            "toggle sidebar",
+            NavigateAction::ToggleSidebar,
+        ),
+        action_entry(
+            keybind_label(&kb.focus_pane_left),
+            "focus pane left",
+            NavigateAction::FocusPaneLeft,
+        ),
+        action_entry(
+            keybind_label(&kb.focus_pane_down),
+            "focus pane down",
+            NavigateAction::FocusPaneDown,
+        ),
+        action_entry(
+            keybind_label(&kb.focus_pane_up),
+            "focus pane up",
+            NavigateAction::FocusPaneUp,
+        ),
+        action_entry(
+            keybind_label(&kb.focus_pane_right),
+            "focus pane right",
+            NavigateAction::FocusPaneRight,
+        ),
+        action_entry(
+            keybind_label(&kb.cycle_pane_next),
+            "cycle pane next",
+            NavigateAction::CyclePaneNext,
+        ),
+        action_entry(
             keybind_label(&kb.cycle_pane_previous),
             "cycle pane previous",
+            NavigateAction::CyclePanePrevious,
         ),
-        help_entry(keybind_label(&kb.last_pane), "last pane"),
+        action_entry(
+            keybind_label(&kb.last_pane),
+            "last pane",
+            NavigateAction::LastPane,
+        ),
     ];
     groups.push(("panes", panes));
 
@@ -163,6 +299,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
                             .clone()
                             .map(Cow::Owned)
                             .unwrap_or(Cow::Borrowed("custom command")),
+                        None,
                     )
                 })
                 .collect(),
@@ -172,7 +309,18 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     groups
 }
 
-pub(crate) fn keybind_help_lines(app: &AppState) -> Vec<(usize, Line<'static>)> {
+/// A row in the rendered keybind help body.
+///
+/// `width` is the visual width used for max-width calculations. `action` is
+/// `Some` when the row is selectable and represents a dispatchable navigate
+/// action; `None` for headings, blank separators, and informational rows.
+pub(crate) struct HelpLine {
+    pub width: usize,
+    pub line: Line<'static>,
+    pub action: Option<NavigateAction>,
+}
+
+pub(crate) fn keybind_help_lines(app: &AppState) -> Vec<HelpLine> {
     let heading_style = Style::default()
         .fg(app.palette.accent)
         .add_modifier(Modifier::BOLD);
@@ -184,32 +332,56 @@ pub(crate) fn keybind_help_lines(app: &AppState) -> Vec<(usize, Line<'static>)> 
     let groups = keybind_help_groups(app);
     let key_width = groups
         .iter()
-        .flat_map(|(_, entries)| entries.iter().map(|(key, _)| key.chars().count()))
+        .flat_map(|(_, entries)| entries.iter().map(|(key, _, _)| key.chars().count()))
         .max()
         .unwrap_or(8);
 
     let mut lines = Vec::new();
 
     for (group, entries) in groups {
-        lines.push((
-            group.len() + 1,
-            Line::from(vec![Span::styled(format!(" {group}"), heading_style)]),
-        ));
-        for (key, label) in entries {
+        lines.push(HelpLine {
+            width: group.len() + 1,
+            line: Line::from(vec![Span::styled(format!(" {group}"), heading_style)]),
+            action: None,
+        });
+        for (key, label, action) in entries {
             let padded_key = format!(" {:<width$} ", key, width = key_width);
             let width = padded_key.chars().count() + label.chars().count();
-            lines.push((
+            lines.push(HelpLine {
                 width,
-                Line::from(vec![
+                line: Line::from(vec![
                     Span::styled(padded_key, key_style),
                     Span::styled(label.into_owned(), label_style),
                 ]),
-            ));
+                action,
+            });
         }
-        lines.push((0, Line::raw("")));
+        lines.push(HelpLine {
+            width: 0,
+            line: Line::raw(""),
+            action: None,
+        });
     }
 
     lines
+}
+
+/// Line indices of rows that can be selected and executed.
+pub(crate) fn keybind_help_actionable_indices(app: &AppState) -> Vec<usize> {
+    keybind_help_lines(app)
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| line.action.map(|_| idx))
+        .collect()
+}
+
+/// Look up the `NavigateAction` for the currently selected actionable row.
+pub(crate) fn selected_keybind_help_action(app: &AppState) -> Option<NavigateAction> {
+    let indices = keybind_help_actionable_indices(app);
+    let line_idx = *indices.get(app.keybind_help.selected)?;
+    keybind_help_lines(app)
+        .get(line_idx)
+        .and_then(|line| line.action)
 }
 
 pub(super) fn render_keybind_help_overlay(app: &AppState, frame: &mut Frame) {
@@ -263,14 +435,37 @@ pub(super) fn render_keybind_help_overlay(app: &AppState, frame: &mut Frame) {
         })
         .unwrap_or(body_area);
 
-    let body = Paragraph::new(
-        keybind_help_lines(app)
-            .into_iter()
-            .map(|(_, line)| line)
-            .collect::<Vec<_>>(),
-    )
-    .wrap(Wrap { trim: false })
-    .scroll((app.keybind_help.scroll, 0));
+    let all_lines = keybind_help_lines(app);
+    let actionable: Vec<usize> = all_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| line.action.map(|_| idx))
+        .collect();
+    let selected_line_idx = actionable.get(app.keybind_help.selected).copied();
+    let highlight_style = Style::default()
+        .fg(panel_contrast_fg(&app.palette))
+        .bg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+
+    let rendered: Vec<Line<'static>> = all_lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, help_line)| {
+            if Some(idx) == selected_line_idx {
+                let mut styled = help_line.line.clone();
+                for span in &mut styled.spans {
+                    span.style = highlight_style;
+                }
+                styled
+            } else {
+                help_line.line
+            }
+        })
+        .collect();
+
+    let body = Paragraph::new(rendered)
+        .wrap(Wrap { trim: false })
+        .scroll((app.keybind_help.scroll, 0));
     frame.render_widget(body, text_area);
     if let Some(track) = track {
         render_scrollbar(
@@ -285,14 +480,14 @@ pub(super) fn render_keybind_help_overlay(app: &AppState, frame: &mut Frame) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" scroll ", Style::default().fg(app.palette.overlay0)),
-            Span::styled("wheel ↑↓", Style::default().fg(app.palette.text)),
+            Span::styled(" select ", Style::default().fg(app.palette.overlay0)),
+            Span::styled("↑↓ / j k", Style::default().fg(app.palette.text)),
             Span::styled("  ·  ", Style::default().fg(app.palette.overlay0)),
-            Span::styled("jump", Style::default().fg(app.palette.overlay0)),
-            Span::styled(" pgup / pgdn ", Style::default().fg(app.palette.text)),
+            Span::styled("run", Style::default().fg(app.palette.overlay0)),
+            Span::styled(" enter ", Style::default().fg(app.palette.text)),
             Span::styled("  ·  ", Style::default().fg(app.palette.overlay0)),
             Span::styled("close", Style::default().fg(app.palette.overlay0)),
-            Span::styled(" esc / enter ", Style::default().fg(app.palette.text)),
+            Span::styled(" esc ", Style::default().fg(app.palette.text)),
         ])),
         stack.footer.unwrap_or_default(),
     );

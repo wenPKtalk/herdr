@@ -96,6 +96,7 @@ pub(super) fn open_global_menu(state: &mut AppState) {
 
 pub(super) fn open_keybind_help(state: &mut AppState) {
     state.keybind_help.scroll = 0;
+    state.keybind_help.selected = 0;
     state.mode = Mode::KeybindHelp;
 }
 
@@ -267,15 +268,32 @@ pub(crate) fn handle_navigator_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_keybind_help_key(
+    state: &mut AppState,
+    terminal_runtimes: &mut crate::terminal::TerminalRuntimeRegistry,
+    key: KeyEvent,
+) {
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => state.scroll_keybind_help(-1),
-        KeyCode::Down | KeyCode::Char('j') => state.scroll_keybind_help(1),
-        KeyCode::PageUp => state.scroll_keybind_help(-8),
-        KeyCode::PageDown => state.scroll_keybind_help(8),
-        KeyCode::Home => state.keybind_help.scroll = 0,
-        KeyCode::End => state.keybind_help.scroll = state.keybind_help_max_scroll(),
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => leave_modal(state),
+        KeyCode::Up | KeyCode::Char('k') => state.move_keybind_help_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => state.move_keybind_help_selection(1),
+        KeyCode::PageUp => state.move_keybind_help_selection(-8),
+        KeyCode::PageDown => state.move_keybind_help_selection(8),
+        KeyCode::Home => state.keybind_help_select_first(),
+        KeyCode::End => state.keybind_help_select_last(),
+        KeyCode::Enter => {
+            if let Some(action) = state.keybind_help_selected_action() {
+                leave_modal(state);
+                super::navigate::execute_navigate_action_in_context(
+                    state,
+                    terminal_runtimes,
+                    action,
+                    super::navigate::ActionContext::Direct,
+                );
+            } else {
+                leave_modal(state);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('?') => leave_modal(state),
         _ => {}
     }
 }
@@ -812,6 +830,54 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("config.toml")
+    }
+
+    #[test]
+    fn keybind_help_enter_dispatches_selected_action_and_closes() {
+        let mut state = state_with_workspaces(&["a"]);
+        open_keybind_help(&mut state);
+
+        // Walk selection forward until we land on ReloadConfig, which has a
+        // simple verifiable side effect (sets request_reload_config). This is
+        // future-proof: if row ordering changes, we still find the action.
+        let actionable_len = crate::ui::keybind_help_actionable_indices(&state).len();
+        let mut found = false;
+        for _ in 0..actionable_len {
+            if state.keybind_help_selected_action()
+                == Some(super::super::navigate::NavigateAction::ReloadConfig)
+            {
+                found = true;
+                break;
+            }
+            state.move_keybind_help_selection(1);
+        }
+        assert!(found, "expected to find ReloadConfig among actionable rows");
+
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        handle_keybind_help_key(
+            &mut state,
+            &mut runtimes,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_ne!(state.mode, Mode::KeybindHelp);
+        assert!(state.request_reload_config);
+    }
+
+    #[test]
+    fn keybind_help_esc_closes_without_dispatch() {
+        let mut state = state_with_workspaces(&["a"]);
+        open_keybind_help(&mut state);
+
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        handle_keybind_help_key(
+            &mut state,
+            &mut runtimes,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+
+        assert_ne!(state.mode, Mode::KeybindHelp);
+        assert!(!state.request_reload_config);
     }
 
     #[test]

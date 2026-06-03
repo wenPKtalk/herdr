@@ -1137,6 +1137,7 @@ pub struct ProductAnnouncementState {
 
 pub struct KeybindHelpState {
     pub scroll: u16,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,7 +1509,10 @@ impl AppState {
             name_input_replace_on_type: false,
             release_notes: None,
             product_announcement: None,
-            keybind_help: KeybindHelpState { scroll: 0 },
+            keybind_help: KeybindHelpState {
+                scroll: 0,
+                selected: 0,
+            },
             navigator: NavigatorState::default(),
             copy_mode: None,
             workspace_scroll: 0,

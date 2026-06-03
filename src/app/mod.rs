@@ -11,7 +11,7 @@ mod api_helpers;
 mod config_io;
 mod creation;
 mod ids;
-mod input;
+pub(crate) mod input;
 mod runtime;
 mod session;
 pub mod state;
@@ -439,7 +439,10 @@ impl App {
                     preview: announcement.preview,
                 }
             }),
-            keybind_help: state::KeybindHelpState { scroll: 0 },
+            keybind_help: state::KeybindHelpState {
+                scroll: 0,
+                selected: 0,
+            },
             navigator: state::NavigatorState::default(),
             copy_mode: None,
             workspace_scroll: 0,
@@ -1351,7 +1354,11 @@ impl App {
                 );
             }
             Mode::KeybindHelp => {
-                input::handle_keybind_help_key(&mut self.state, key_event);
+                input::handle_keybind_help_key(
+                    &mut self.state,
+                    &mut self.terminal_runtimes,
+                    key_event,
+                );
             }
             Mode::GlobalMenu => {
                 input::handle_global_menu_key(&mut self.state, key_event);

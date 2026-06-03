@@ -662,7 +662,7 @@ impl AppState {
         let wrap_width = body.width.max(1) as usize;
         let total_rows = crate::ui::keybind_help_lines(self)
             .into_iter()
-            .map(|(width, _)| width.max(1).div_ceil(wrap_width))
+            .map(|line| line.width.max(1).div_ceil(wrap_width))
             .sum::<usize>();
         let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
         Some(crate::pane::ScrollMetrics {
@@ -721,6 +721,71 @@ impl AppState {
         let current = self.keybind_help.scroll as i16;
         self.keybind_help.scroll = current.saturating_add(delta).clamp(0, max_scroll as i16) as u16;
     }
+
+    /// Move the keybind-help row cursor by `delta` actionable rows. The cursor
+    /// only ever lands on rows whose `action` is `Some`, so headings, blanks,
+    /// and informational rows are skipped automatically. Adjusts scroll so the
+    /// selected row stays inside the viewport.
+    pub(super) fn move_keybind_help_selection(&mut self, delta: i32) {
+        let actionable = crate::ui::keybind_help_actionable_indices(self);
+        if actionable.is_empty() {
+            return;
+        }
+        let current = self.keybind_help.selected as i32;
+        let max_idx = (actionable.len() - 1) as i32;
+        self.keybind_help.selected = current.saturating_add(delta).clamp(0, max_idx) as usize;
+        self.ensure_keybind_help_selection_visible();
+    }
+
+    pub(super) fn keybind_help_select_first(&mut self) {
+        self.keybind_help.selected = 0;
+        self.ensure_keybind_help_selection_visible();
+    }
+
+    pub(super) fn keybind_help_select_last(&mut self) {
+        let actionable_len = crate::ui::keybind_help_actionable_indices(self).len();
+        if actionable_len == 0 {
+            return;
+        }
+        self.keybind_help.selected = actionable_len - 1;
+        self.ensure_keybind_help_selection_visible();
+    }
+
+    /// Returns the action attached to the currently selected actionable row,
+    /// or `None` if no actionable rows are present.
+    pub(super) fn keybind_help_selected_action(&self) -> Option<super::navigate::NavigateAction> {
+        crate::ui::selected_keybind_help_action(self)
+    }
+
+    fn ensure_keybind_help_selection_visible(&mut self) {
+        let Some(body) = self.keybind_help_body_rect() else {
+            return;
+        };
+        let viewport_rows = body.height.max(1) as usize;
+        let wrap_width = body.width.max(1) as usize;
+        let lines = crate::ui::keybind_help_lines(self);
+        let actionable = crate::ui::keybind_help_actionable_indices(self);
+        let Some(target_line_idx) = actionable.get(self.keybind_help.selected).copied() else {
+            return;
+        };
+        let target_y: usize = lines
+            .iter()
+            .take(target_line_idx)
+            .map(|line| line.width.max(1).div_ceil(wrap_width))
+            .sum();
+        let line_height = lines
+            .get(target_line_idx)
+            .map(|line| line.width.max(1).div_ceil(wrap_width))
+            .unwrap_or(1);
+        let max_scroll = self.keybind_help_max_scroll() as usize;
+        let scroll = self.keybind_help.scroll as usize;
+        if target_y < scroll {
+            self.keybind_help.scroll = (target_y.min(max_scroll)) as u16;
+        } else if target_y + line_height > scroll + viewport_rows {
+            let new_scroll = (target_y + line_height).saturating_sub(viewport_rows);
+            self.keybind_help.scroll = (new_scroll.min(max_scroll)) as u16;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -728,8 +793,77 @@ mod tests {
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
-    use super::super::{app_for_mouse_test, mouse};
+    use super::super::{app_for_mouse_test, mouse, state_with_workspaces};
     use super::*;
+
+    #[test]
+    fn keybind_help_selection_starts_on_actionable_row() {
+        let app = crate::app::state::AppState::test_new();
+        let indices = crate::ui::keybind_help_actionable_indices(&app);
+        assert!(
+            !indices.is_empty(),
+            "default config should have actionable rows"
+        );
+        let action = crate::ui::selected_keybind_help_action(&app);
+        assert!(action.is_some(), "selected=0 must map to an action");
+    }
+
+    #[test]
+    fn move_keybind_help_selection_walks_actionable_rows_in_order() {
+        let mut app = crate::app::state::AppState::test_new();
+        let indices = crate::ui::keybind_help_actionable_indices(&app);
+        assert!(indices.len() >= 3);
+
+        app.move_keybind_help_selection(1);
+        assert_eq!(app.keybind_help.selected, 1);
+        app.move_keybind_help_selection(1);
+        assert_eq!(app.keybind_help.selected, 2);
+    }
+
+    #[test]
+    fn move_keybind_help_selection_clamps_at_bounds() {
+        let mut app = crate::app::state::AppState::test_new();
+        let actionable_len = crate::ui::keybind_help_actionable_indices(&app).len();
+        assert!(actionable_len >= 2);
+
+        // moving past the start clamps to 0
+        app.move_keybind_help_selection(-1000);
+        assert_eq!(app.keybind_help.selected, 0);
+
+        // moving past the end clamps to last actionable index
+        app.move_keybind_help_selection(1000);
+        assert_eq!(app.keybind_help.selected, actionable_len - 1);
+    }
+
+    #[test]
+    fn keybind_help_select_last_picks_last_actionable_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        let actionable_len = crate::ui::keybind_help_actionable_indices(&app).len();
+        assert!(actionable_len >= 2);
+
+        app.keybind_help_select_last();
+        assert_eq!(app.keybind_help.selected, actionable_len - 1);
+        assert!(app.keybind_help_selected_action().is_some());
+    }
+
+    #[test]
+    fn keybind_help_select_first_resets_to_top() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.keybind_help.selected = 4;
+        app.keybind_help_select_first();
+        assert_eq!(app.keybind_help.selected, 0);
+    }
+
+    #[test]
+    fn opening_keybind_help_resets_selection() {
+        let mut state = state_with_workspaces(&["a"]);
+        state.keybind_help.selected = 7;
+        state.keybind_help.scroll = 5;
+        super::super::modal::open_keybind_help(&mut state);
+        assert_eq!(state.keybind_help.selected, 0);
+        assert_eq!(state.keybind_help.scroll, 0);
+        assert_eq!(state.mode, Mode::KeybindHelp);
+    }
 
     #[test]
     fn clicking_keybind_help_close_button_closes_overlay() {

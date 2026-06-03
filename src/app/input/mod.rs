@@ -38,7 +38,7 @@ pub(crate) use self::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
         handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
     },
-    navigate::terminal_direct_navigation_action,
+    navigate::{terminal_direct_navigation_action, NavigateAction},
     settings::open_settings_at,
 };
 use self::{
@@ -85,7 +85,11 @@ impl App {
                     }
                     Mode::Settings => self.handle_settings_key(key_event),
                     Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
-                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+                    Mode::KeybindHelp => handle_keybind_help_key(
+                        &mut self.state,
+                        &mut self.terminal_runtimes,
+                        key_event,
+                    ),
                     Mode::Navigator => handle_navigator_key(&mut self.state, key_event),
                     Mode::Terminal => unreachable!(),
                 }
