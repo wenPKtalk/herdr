@@ -33,6 +33,17 @@ Herdr shows first-run setup when `onboarding` is missing or true. Continuing fro
 onboarding = false
 ```
 
+## Update channel
+
+Direct installs use the stable update channel by default.
+
+```toml
+[update]
+channel = "stable"
+```
+
+Set `channel = "preview"` to make `herdr update` install preview builds from the current development branch. Homebrew, mise, and Nix installs ignore the preview channel and update through their package managers.
+
 ## Reload config
 
 Reload a running server after editing `config.toml`:
@@ -90,6 +101,17 @@ Worktree actions are available from Git workspace rows. `New worktree` creates a
 Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Herdr group, but it does not delete checkout folders or branches.
 
 Deleting a worktree checkout is explicit. Use `Delete worktree checkout...` on a grouped child workspace to run `git worktree remove`. Herdr first asks Git to remove safely. If Git refuses because the checkout has modified or untracked files, Herdr asks again before running the forced remove. Branches are not deleted.
+
+## Remote attach
+
+Remote attach manages its SSH bridge with a temporary keepalive fallback by default.
+
+```toml
+[remote]
+manage_ssh_config = true
+```
+
+When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Herdr's generated config.
 
 ## Keybindings
 
@@ -377,10 +399,10 @@ Herdr can restart supported agent panes in their native conversation sessions af
 
 ```toml
 [session]
-resume_agents_on_restore = false
+resume_agents_on_restore = true
 ```
 
-When enabled, Herdr only resumes panes that reported a native session reference through an official Herdr integration. Supported resume targets are Claude Code, Codex, Pi, Hermes Agent, and OpenCode. Unsupported, missing, invalid, duplicated, or stale session references restore as a normal shell in the saved pane directory.
+This is enabled by default. Herdr only resumes panes that reported a native session reference through an official Herdr integration. Supported resume targets are Claude Code, Codex, GitHub Copilot CLI, Pi, Hermes Agent, and OpenCode. Unsupported, missing, invalid, duplicated, or stale session references restore as a normal shell in the saved pane directory.
 
 Session references are stored in the local Herdr session snapshot. They are not shown in normal pane, agent, status, or event output.
 
@@ -408,6 +430,21 @@ When enabled, the cursor stays visible at the focused pane's reported position. 
 Hot-reloads through the existing `[experimental]` block.
 
 The trade-off when enabled: an extra hardware cursor is visible in the outer terminal for apps that hide the cursor without painting a replacement (vim normal mode, etc.). Pair the reveal with `cjk_ime_agents` to scope it to specific TUIs.
+
+## Prefix input source switching
+
+On macOS, prefix-mode commands can be hard to use while a non-ASCII input source is active because prefix commands are still interpreted through the host input source.
+
+Set `switch_ascii_input_source_in_prefix = true` to switch the host input source to the system ASCII-capable input source while prefix mode is active:
+
+```toml
+[experimental]
+switch_ascii_input_source_in_prefix = false
+```
+
+When enabled, Herdr switches input sources only after prefix mode is entered, then restores the previous input source when prefix mode exits. The setting is macOS-only and is a no-op on other platforms or when the system input-source switch fails.
+
+You can also toggle it from Settings > Experiments > switch to ascii input source in prefix (macOS).
 
 ## Environment variables
 

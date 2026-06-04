@@ -21,6 +21,8 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 mod agent_resume;
 mod api;
 mod app;
+mod build_info;
+mod checksum;
 mod cli;
 mod client;
 mod config;
@@ -43,6 +45,7 @@ mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod render_prof;
 mod selection;
 mod server;
 mod session;
@@ -93,6 +96,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Use "follow" to inherit the source pane/workspace, "home" for $HOME,
 # "current" for Herdr's process directory, or a fixed path such as "~/Projects".
 # new_cwd = "follow"
+
+[update]
+# Update channel used by background checks and `herdr update`.
+# Use "stable" for normal releases or "preview" for opt-in preview builds.
+# channel = "stable"
 
 [keys]
 # Prefix key to enter prefix mode (default: "ctrl+b")
@@ -246,7 +254,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 [session]
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
-# resume_agents_on_restore = false
+# resume_agents_on_restore = true
+
+[remote]
+# Whether herdr manages the ssh config used for the `herdr --remote` bridge.
+# When true (default), herdr runs the bridge ssh through a generated config that
+# includes your ~/.ssh/config first and adds ServerAliveInterval/
+# ServerAliveCountMax as a fallback (so any keepalive you set yourself still
+# wins) to survive idle network/NAT timeouts. Set false to run plain ssh against
+# your ssh config unchanged — this does not force keepalive off, it only stops
+# herdr from adding its own.
+# manage_ssh_config = true
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -256,6 +274,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # kitty_graphics = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
+# While prefix mode is active, temporarily switch the macOS host input
+# source to an ASCII-capable keyboard layout so prefix commands register
+# even when a CJK IME is active, then restore the previous input source
+# when prefix mode exits. macOS only; best-effort. Default: false.
+# switch_ascii_input_source_in_prefix = false
 # Expose the focused pane's cursor to the outer terminal so macOS input
 # methods keep tracking the candidate window when TUIs paint their own
 # cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
@@ -393,9 +416,11 @@ fn main() -> io::Result<()> {
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
         println!("       herdr update [--handoff]");
+        println!("       herdr channel set <stable|preview>");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
         println!("       herdr config <subcommand> ...");
+        println!("       herdr channel <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
@@ -418,12 +443,20 @@ fn main() -> io::Result<()> {
                 "Stop the running server via the API socket",
             ),
             (
+                "herdr channel set <stable|preview>",
+                "Choose the stable or preview update channel",
+            ),
+            (
                 "herdr server reload-config",
                 "Reload config.toml in the running server",
             ),
             (
                 "herdr config reset-keys",
                 "Back up config.toml and remove custom keybindings",
+            ),
+            (
+                "herdr channel <subcommand>",
+                "Manage the stable or preview update channel",
             ),
             (
                 "herdr workspace <subcommand>",
@@ -480,7 +513,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("herdr {}", env!("CARGO_PKG_VERSION"));
+        println!("herdr {}", crate::build_info::version());
         return Ok(());
     }
 
@@ -516,6 +549,7 @@ fn main() -> io::Result<()> {
                 "update",
                 "status",
                 "config",
+                "channel",
                 "workspace",
                 "worktree",
                 "pane",
