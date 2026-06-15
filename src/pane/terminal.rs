@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::layout::PaneId;
 use crate::protocol::CellData;
 
+use super::cursor::{CursorPositionSettleState, DecscusrTracker, CURSOR_POSITION_SETTLE};
 use super::{
     input::{
         ghostty_key_event_from_terminal_key, ghostty_mouse_encoder_for_terminal,
@@ -23,14 +24,16 @@ use super::{
     osc::{
         contains_scrollback_clear_sequence, current_transient_default_color_owner,
         maybe_filter_primary_screen_scrollback_clear, restore_host_terminal_theme_if_needed,
-        write_host_terminal_theme, DefaultColorEvent, DefaultColorEventTracker,
-        DefaultColorOscTracker, DefaultColorQuery, DefaultColorTrackedEvent, Osc52Forwarder,
+        write_host_terminal_theme, AgentOscStateTracker, CwdOscTracker, DefaultColorEvent,
+        DefaultColorEventTracker, DefaultColorOscTracker, DefaultColorQuery,
+        DefaultColorTrackedEvent, Osc52Forwarder, OscDebugTracker,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
 
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
+const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
@@ -101,6 +104,7 @@ pub(crate) struct ProcessBytesResult {
     pub request_render: bool,
     pub render_delay: Option<Duration>,
     pub clipboard_writes: Vec<Vec<u8>>,
+    pub reported_cwd: Option<std::path::PathBuf>,
     pub terminal_responses: Vec<Bytes>,
 }
 
@@ -123,7 +127,12 @@ pub(crate) struct GhosttyPaneCore {
     pub child_default_foreground_changed: bool,
     pub child_default_background_changed: bool,
     pub osc52_forwarder: Osc52Forwarder,
+    pub cwd_osc_tracker: CwdOscTracker,
+    pub osc_debug_tracker: OscDebugTracker,
+    pub agent_osc_state: AgentOscStateTracker,
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
+    decscusr_tracker: DecscusrTracker,
+    cursor_settle_state: CursorPositionSettleState,
 }
 
 pub(crate) struct PaneTerminal {
@@ -146,9 +155,15 @@ impl PaneTerminal {
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
     }
 
-    pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
+    pub fn resize(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
         self.ghostty
-            .resize(rows, cols, cell_width_px, cell_height_px);
+            .resize(rows, cols, cell_width_px, cell_height_px)
     }
 
     pub fn scroll_up(&self, lines: usize) {
@@ -175,8 +190,16 @@ impl PaneTerminal {
         self.ghostty.input_state()
     }
 
+    pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
+        self.ghostty.wheel_routing()
+    }
+
     pub fn cursor_state(&self) -> Option<TerminalCursorState> {
         self.ghostty.cursor_state()
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.ghostty.synchronized_output_active()
     }
 
     pub fn visible_text(&self) -> String {
@@ -251,6 +274,21 @@ impl PaneTerminal {
             .maybe_restore_host_terminal_theme(pane_id, shell_pid)
     }
 
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_title(&self) -> String {
+        self.ghostty.agent_osc_title()
+    }
+
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_progress(&self) -> String {
+        self.ghostty.agent_osc_progress()
+    }
+
+    /// Clears retained OSC title/progress evidence on foreground agent change.
+    pub fn clear_agent_osc_state(&self) {
+        self.ghostty.clear_agent_osc_state()
+    }
+
     pub fn keyboard_protocol(
         &self,
         fallback: crate::input::KeyboardProtocol,
@@ -258,6 +296,7 @@ impl PaneTerminal {
         self.ghostty.keyboard_protocol().unwrap_or(fallback)
     }
 
+    #[cfg(unix)]
     pub fn kitty_keyboard_state_ansi(&self) -> Option<String> {
         self.ghostty
             .kitty_keyboard_state_ansi()
@@ -346,7 +385,12 @@ impl GhosttyPaneTerminal {
                 child_default_foreground_changed: false,
                 child_default_background_changed: false,
                 osc52_forwarder: Osc52Forwarder::default(),
+                cwd_osc_tracker: CwdOscTracker::default(),
+                osc_debug_tracker: OscDebugTracker::default(),
+                agent_osc_state: AgentOscStateTracker::default(),
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
+                decscusr_tracker: DecscusrTracker::default(),
+                cursor_settle_state: CursorPositionSettleState::default(),
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -399,6 +443,34 @@ impl GhosttyPaneTerminal {
         )
     }
 
+    /// Returns the latest OSC 0/2 title retained for agent detection, or `""`
+    /// if no title has been seen or the last update was an empty clear.
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_title(&self) -> String {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.latest_title().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Returns the latest OSC 9 progress payload retained for agent detection,
+    /// or `""` if none has been seen.
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_progress(&self) -> String {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.latest_progress().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Clears retained OSC title/progress evidence when the pane's foreground
+    /// agent changes, so a new agent process starts from a blank OSC slate.
+    pub fn clear_agent_osc_state(&self) {
+        if let Ok(mut core) = self.core.lock() {
+            core.agent_osc_state.clear_retained();
+        }
+    }
+
     pub fn process_pty_bytes(
         &self,
         pane_id: PaneId,
@@ -413,6 +485,7 @@ impl GhosttyPaneTerminal {
                 request_render: false,
                 render_delay: None,
                 clipboard_writes: Vec::new(),
+                reported_cwd: None,
                 terminal_responses: Vec::new(),
             };
         };
@@ -430,6 +503,18 @@ impl GhosttyPaneTerminal {
 
         core.osc52_forwarder.observe(bytes);
         let clipboard_writes = core.osc52_forwarder.drain_pending();
+        core.cwd_osc_tracker.observe(bytes);
+        let reported_cwd = core.cwd_osc_tracker.drain_latest();
+        core.osc_debug_tracker.observe(bytes);
+        for event in core.osc_debug_tracker.drain_pending() {
+            debug!(
+                pane = pane_id.raw(),
+                osc_command = %event.command,
+                osc_payload = ?event.payload,
+                "agent OSC evidence observed"
+            );
+        }
+        core.agent_osc_state.observe(bytes);
 
         let alternate_screen = core
             .terminal
@@ -461,6 +546,7 @@ impl GhosttyPaneTerminal {
             .observe(filtered_bytes.as_ref());
         core.xtgettcap_query_tracker
             .observe(filtered_bytes.as_ref());
+        core.decscusr_tracker.observe(filtered_bytes.as_ref());
         let default_color_events = core.default_color_event_tracker.drain_pending();
         let xtgettcap_responses = core.xtgettcap_query_tracker.drain_pending();
         let write_started = crate::render_prof::timer();
@@ -485,9 +571,20 @@ impl GhosttyPaneTerminal {
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false);
+        if CURSOR_POSITION_SETTLE_ENABLED {
+            let cursor_started = crate::render_prof::timer();
+            let cursor_after_write = current_cursor_state(&mut core);
+            crate::render_prof::duration_since("pty.cursor_state_update", cursor_started);
+            core.cursor_settle_state
+                .observe(cursor_after_write, Instant::now());
+        }
         let request_render = !synchronized_output && !has_kitty_graphics_sequence;
-        let render_delay = (!synchronized_output && has_kitty_graphics_sequence)
-            .then_some(KITTY_GRAPHICS_REDRAW_SETTLE);
+        let render_delay = render_delay_after_pty_write(
+            synchronized_output,
+            has_kitty_graphics_sequence,
+            cursor_position_settle_pending(&core),
+            CURSOR_POSITION_SETTLE_ENABLED,
+        );
         if request_render {
             crate::render_prof::event("pty.request_render");
         }
@@ -501,6 +598,7 @@ impl GhosttyPaneTerminal {
             request_render,
             render_delay,
             clipboard_writes,
+            reported_cwd,
             terminal_responses,
         }
     }
@@ -570,6 +668,7 @@ impl GhosttyPaneTerminal {
         }
     }
 
+    #[cfg(unix)]
     pub fn seed_handoff_input_state(&self, input_state: InputState) {
         let Ok(mut core) = self.core.lock() else {
             return;
@@ -641,6 +740,7 @@ impl GhosttyPaneTerminal {
         }
     }
 
+    #[cfg(unix)]
     pub fn seed_keyboard_protocol_flags(&self, flags: u16) {
         if flags == 0 {
             return;
@@ -648,6 +748,7 @@ impl GhosttyPaneTerminal {
         self.seed_keyboard_protocol_ansi(&format!("\x1b[>{flags}u"));
     }
 
+    #[cfg(unix)]
     pub fn seed_keyboard_protocol_ansi(&self, ansi: &str) {
         if ansi.is_empty() {
             return;
@@ -662,7 +763,13 @@ impl GhosttyPaneTerminal {
         }
     }
 
-    pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
+    pub fn resize(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
             let offset_from_bottom = core
                 .terminal
@@ -694,6 +801,7 @@ impl GhosttyPaneTerminal {
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            let terminal_responses = self.drain_pending_pty_responses();
 
             let bottom_is_blank = ghostty_detection_text(&core)
                 .map(|text| text.trim().is_empty())
@@ -716,6 +824,9 @@ impl GhosttyPaneTerminal {
                     remaining -= 1;
                 }
             }
+            terminal_responses
+        } else {
+            Vec::new()
         }
     }
 
@@ -769,6 +880,7 @@ impl GhosttyPaneTerminal {
         ))
     }
 
+    #[cfg(unix)]
     pub fn kitty_keyboard_state_ansi(&self) -> Option<String> {
         let core = self.core.lock().ok()?;
         core.kitty_keyboard.replay_ansi()
@@ -838,27 +950,45 @@ impl GhosttyPaneTerminal {
         })
     }
 
+    pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
+        let Ok(core) = self.core.lock() else {
+            return None;
+        };
+        let alternate_screen =
+            core.terminal.active_screen().ok()? == crate::ghostty::ActiveScreen::Alternate;
+        let mouse_alternate_scroll = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL)
+            .ok()?;
+        let mouse_reporting = core.terminal.mode_get(MODE_MOUSE_ANY_MOTION).ok()?
+            || core.terminal.mode_get(MODE_MOUSE_BUTTON_MOTION).ok()?
+            || core.terminal.mode_get(MODE_MOUSE_PRESS_RELEASE).ok()?
+            || core.terminal.mode_get(MODE_MOUSE_X10).ok()?;
+        Some(if mouse_reporting {
+            crate::pane::WheelRouting::MouseReport
+        } else if alternate_screen && mouse_alternate_scroll {
+            crate::pane::WheelRouting::AlternateScroll
+        } else {
+            crate::pane::WheelRouting::HostScroll
+        })
+    }
+
     pub fn cursor_state(&self) -> Option<TerminalCursorState> {
         let mut core = self.core.lock().ok()?;
-        let GhosttyPaneCore {
-            terminal,
-            render_state,
-            ..
-        } = &mut *core;
-        render_state.update(terminal).ok()?;
-        let cursor = render_state.cursor_viewport().ok()??;
-        let shape = render_state
-            .cursor_visual_style()
+        let current = current_cursor_state(&mut core);
+        effective_cursor_state(&mut core, current)
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.core
+            .lock()
             .ok()
-            .zip(render_state.cursor_blinking().ok())
-            .map(|(style, blinking)| decscusr_cursor_shape(style, blinking))
-            .unwrap_or(0);
-        Some(TerminalCursorState {
-            x: cursor.x,
-            y: cursor.y,
-            visible: render_state.cursor_visible().ok()?,
-            shape,
-        })
+            .and_then(|core| {
+                core.terminal
+                    .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+                    .ok()
+            })
+            .unwrap_or(false)
     }
 
     pub fn encode_terminal_key(
@@ -895,7 +1025,10 @@ impl GhosttyPaneTerminal {
         };
         let mut encoder = ghostty_mouse_encoder_for_terminal(&core.terminal)?;
         let event = ghostty_mouse_event_from_button_kind(kind, column, row, modifiers)?;
-        encoder.encode(&event).ok()
+        encoder
+            .encode(&event)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
     }
 
     pub fn encode_mouse_motion(
@@ -913,7 +1046,10 @@ impl GhosttyPaneTerminal {
         }
         let mut encoder = ghostty_mouse_encoder_for_terminal(&core.terminal)?;
         let event = ghostty_mouse_event_from_motion_kind(kind, column, row, modifiers)?;
-        encoder.encode(&event).ok()
+        encoder
+            .encode(&event)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
     }
 
     pub fn encode_mouse_wheel(
@@ -928,7 +1064,10 @@ impl GhosttyPaneTerminal {
         };
         let mut encoder = ghostty_mouse_encoder_for_terminal(&core.terminal)?;
         let event = ghostty_mouse_event_from_wheel_kind(kind, column, row, modifiers)?;
-        encoder.encode(&event).ok()
+        encoder
+            .encode(&event)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
     }
 
     pub fn visible_text(&self) -> String {
@@ -1030,6 +1169,7 @@ impl GhosttyPaneTerminal {
         let GhosttyPaneCore {
             terminal,
             render_state,
+            decscusr_tracker,
             ..
         } = &mut *core;
         if render_state.update(terminal).is_err() {
@@ -1115,8 +1255,11 @@ impl GhosttyPaneTerminal {
 
         ghostty_clear_render_dirty(render_state, area.height);
 
-        if show_cursor && render_state.cursor_visible().ok() == Some(true) {
-            if let Ok(Some(cursor)) = render_state.cursor_viewport() {
+        let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
+        if show_cursor {
+            if let Some(cursor) =
+                effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
+            {
                 if cursor.x < area.width && cursor.y < area.height {
                     frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
                 }
@@ -1135,6 +1278,72 @@ impl GhosttyPaneTerminal {
             .map(|mut core| ghostty_collect_dirty_patch(&mut core, area_width, area_height))
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
     }
+}
+
+fn cursor_position_settle_pending(core: &GhosttyPaneCore) -> bool {
+    core.cursor_settle_state.pending()
+}
+
+fn effective_cursor_state(
+    core: &mut GhosttyPaneCore,
+    current: Option<TerminalCursorState>,
+) -> Option<TerminalCursorState> {
+    if !CURSOR_POSITION_SETTLE_ENABLED {
+        return current;
+    }
+    core.cursor_settle_state
+        .reported_cursor(current, Instant::now())
+}
+
+fn render_delay_after_pty_write(
+    synchronized_output: bool,
+    has_kitty_graphics_sequence: bool,
+    cursor_position_settle_pending: bool,
+    cursor_position_settle_enabled: bool,
+) -> Option<Duration> {
+    if synchronized_output {
+        None
+    } else if has_kitty_graphics_sequence {
+        Some(KITTY_GRAPHICS_REDRAW_SETTLE)
+    } else if cursor_position_settle_enabled && cursor_position_settle_pending {
+        Some(CURSOR_POSITION_SETTLE)
+    } else {
+        None
+    }
+}
+
+fn current_cursor_state(core: &mut GhosttyPaneCore) -> Option<TerminalCursorState> {
+    let GhosttyPaneCore {
+        terminal,
+        render_state,
+        decscusr_tracker,
+        ..
+    } = core;
+    render_state.update(terminal).ok()?;
+    cursor_state_from_render_state(render_state, decscusr_tracker)
+}
+
+fn cursor_state_from_render_state(
+    render_state: &mut crate::ghostty::RenderState,
+    decscusr_tracker: &DecscusrTracker,
+) -> Option<TerminalCursorState> {
+    let cursor = render_state.cursor_viewport().ok()??;
+    let shape = if decscusr_tracker.cursor_shape_overridden() {
+        render_state
+            .cursor_visual_style()
+            .ok()
+            .zip(render_state.cursor_blinking().ok())
+            .map(|(style, blinking)| decscusr_cursor_shape(style, blinking))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Some(TerminalCursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: render_state.cursor_visible().ok()?,
+        shape,
+    })
 }
 
 type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
@@ -1961,6 +2170,110 @@ mod tests {
     }
 
     #[test]
+    fn cursor_state_uses_terminal_default_until_child_sets_shape() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        assert_eq!(pane.cursor_state().unwrap().shape, 0);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[6 q", &tx);
+
+        assert_eq!(pane.cursor_state().unwrap().shape, 6);
+    }
+
+    #[test]
+    fn cursor_state_returns_terminal_default_after_decscusr_reset() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2 q", &tx);
+        assert_eq!(pane.cursor_state().unwrap().shape, 2);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[0 q", &tx);
+
+        assert_eq!(pane.cursor_state().unwrap().shape, 0);
+    }
+
+    #[test]
+    fn cursor_shape_tracker_handles_split_decscusr_sequences() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"5 ", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"q", &tx);
+
+        assert_eq!(pane.cursor_state().unwrap().shape, 5);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cursor_state_holds_pty_position_change_until_settle_window() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"x", &tx);
+        assert_eq!(
+            pane.cursor_state()
+                .map(|cursor| (cursor.x, cursor.y, cursor.visible)),
+            Some((1, 0, true))
+        );
+
+        let result = pane.process_pty_bytes(pane_id, 0, b"\x1b[6;21H", &tx);
+
+        assert_eq!(result.render_delay, Some(CURSOR_POSITION_SETTLE));
+        assert_eq!(
+            pane.cursor_state()
+                .map(|cursor| (cursor.x, cursor.y, cursor.visible)),
+            Some((1, 0, true))
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn cursor_state_uses_live_position_when_settle_policy_disabled() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"x", &tx);
+        let result = pane.process_pty_bytes(pane_id, 0, b"\x1b[6;21H", &tx);
+
+        assert_eq!(result.render_delay, None);
+        assert_eq!(
+            pane.cursor_state()
+                .map(|cursor| (cursor.x, cursor.y, cursor.visible)),
+            Some((20, 5, true))
+        );
+    }
+
+    #[test]
+    fn cursor_settle_policy_controls_render_delay() {
+        assert_eq!(
+            render_delay_after_pty_write(false, false, true, true),
+            Some(CURSOR_POSITION_SETTLE)
+        );
+        assert_eq!(
+            render_delay_after_pty_write(false, false, true, false),
+            None
+        );
+        assert_eq!(
+            render_delay_after_pty_write(false, true, true, false),
+            Some(KITTY_GRAPHICS_REDRAW_SETTLE)
+        );
+        assert_eq!(render_delay_after_pty_write(true, false, true, true), None);
+    }
+
+    #[test]
     fn host_terminal_theme_restore_probe_skips_when_no_transient_override() {
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
@@ -2128,6 +2441,7 @@ mod tests {
         assert_eq!(encoded, b"\x1bOA");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ghostty_seed_handoff_input_state_restores_input_modes() {
         let (tx, _rx) = mpsc::channel(4);
@@ -2238,6 +2552,7 @@ mod tests {
         assert_eq!(encoded, b"\x1b[13;2u");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ghostty_seed_keyboard_protocol_flags_restores_shift_enter_encoding() {
         let (tx, _rx) = mpsc::channel(4);
@@ -2255,6 +2570,7 @@ mod tests {
         assert_eq!(encoded, b"\x1b[13;2u");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ghostty_keyboard_protocol_state_replays_nested_stack() {
         let (tx, _rx) = mpsc::channel(4);
@@ -2380,6 +2696,23 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_mouse_drag_without_motion_reporting_is_not_forwarded() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"\x1b[?1000h\x1b[?1006h");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let encoded = pane.encode_mouse_button(
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            4,
+            6,
+            crossterm::event::KeyModifiers::empty(),
+        );
+
+        assert_eq!(encoded, None);
+    }
+
+    #[test]
     fn ghostty_mouse_moved_encoding_uses_any_motion_state() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
@@ -2416,6 +2749,8 @@ mod tests {
     #[test]
     fn ghostty_normalize_buffer_symbol_prefers_grapheme_width_when_metadata_disagrees() {
         const WIDE_GRAPHEME: &str = "🙂";
+        const FLAG_GRAPHEME: &str = "🇧🇷";
+        const FAMILY_GRAPHEME: &str = "👨‍👩‍👧";
         const VS16_GRAPHEME: &str = "⚠️";
         const EMOJI_GRAPHEME: &str = "💳";
 
@@ -2426,6 +2761,14 @@ mod tests {
         assert_eq!(
             ghostty_normalize_buffer_symbol("a", crate::ghostty::CellWide::Wide),
             "  "
+        );
+        assert_eq!(
+            ghostty_normalize_buffer_symbol(FLAG_GRAPHEME, crate::ghostty::CellWide::Wide),
+            FLAG_GRAPHEME
+        );
+        assert_eq!(
+            ghostty_normalize_buffer_symbol(FAMILY_GRAPHEME, crate::ghostty::CellWide::Wide),
+            FAMILY_GRAPHEME
         );
         assert_eq!(
             ghostty_normalize_buffer_symbol("⌨️", crate::ghostty::CellWide::Narrow),
@@ -2446,6 +2789,74 @@ mod tests {
         assert_eq!(
             ghostty_normalize_buffer_symbol("xx", crate::ghostty::CellWide::SpacerHead),
             " "
+        );
+    }
+
+    fn render_cells_to_symbols(
+        terminal: &mut crate::ghostty::Terminal,
+    ) -> Vec<(crate::ghostty::CellWide, String)> {
+        let mut render_state = crate::ghostty::RenderState::new().unwrap();
+        render_state.update(terminal).unwrap();
+
+        let mut row_iterator = crate::ghostty::RowIterator::new().unwrap();
+        let mut rows = render_state
+            .populate_row_iterator(&mut row_iterator)
+            .unwrap();
+        let mut row_cells = crate::ghostty::RowCells::new().unwrap();
+        let mut grapheme_codepoints = Vec::new();
+        let mut symbol_scratch = String::new();
+        let mut out = Vec::new();
+
+        if rows.next() {
+            let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+            while cells.next() {
+                let wide = cells.wide().unwrap_or(crate::ghostty::CellWide::Narrow);
+                let symbol = ghostty_buffer_symbol_into(
+                    &cells,
+                    wide,
+                    false,
+                    &mut grapheme_codepoints,
+                    &mut symbol_scratch,
+                )
+                .unwrap()
+                .to_string();
+                out.push((wide, symbol));
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn grapheme_cluster_mode_renders_flag_emoji_in_single_wide_cell() {
+        let mut terminal = crate::ghostty::Terminal::new(40, 1, 0).unwrap();
+        terminal.enable_grapheme_cluster_mode().unwrap();
+        terminal.write("🇧🇷".as_bytes());
+
+        let cells = render_cells_to_symbols(&mut terminal);
+
+        assert!(
+            cells
+                .iter()
+                .any(|(wide, symbol)| *wide == crate::ghostty::CellWide::Wide && symbol == "🇧🇷"),
+            "expected a wide cell containing the full flag grapheme, got {cells:?}"
+        );
+    }
+
+    #[test]
+    fn grapheme_cluster_mode_renders_zwj_family_in_single_wide_cell() {
+        let mut terminal = crate::ghostty::Terminal::new(40, 1, 0).unwrap();
+        terminal.enable_grapheme_cluster_mode().unwrap();
+        terminal.write("👨\u{200d}👩\u{200d}👧".as_bytes());
+
+        let cells = render_cells_to_symbols(&mut terminal);
+
+        assert!(
+            cells
+                .iter()
+                .any(|(wide, symbol)| *wide == crate::ghostty::CellWide::Wide
+                    && symbol == "👨\u{200d}👩\u{200d}👧"),
+            "expected a wide cell containing the full ZWJ grapheme, got {cells:?}"
         );
     }
 
@@ -2619,6 +3030,21 @@ mod tests {
 
         assert!(pane.detection_text().trim().is_empty());
         assert!(pane.recent_text(3).trim().is_empty());
+    }
+
+    #[test]
+    fn resize_returns_in_band_size_report_response() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.mode_set(2048, true).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let responses = pane.resize(40, 100, 9, 18);
+
+        assert_eq!(
+            responses,
+            vec![Bytes::from_static(b"\x1B[48;40;100;720;900t")]
+        );
     }
 
     #[test]

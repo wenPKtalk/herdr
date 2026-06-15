@@ -1286,6 +1286,7 @@ mod tests {
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn all_workspaces_agent_panel_entries_use_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(
@@ -1329,6 +1330,7 @@ mod tests {
             0,
             crate::terminal_theme::TerminalTheme::default(),
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

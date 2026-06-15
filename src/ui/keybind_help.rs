@@ -24,11 +24,7 @@ fn info_entry(key: impl Into<String>, label: &'static str) -> HelpEntry {
     (key.into(), Cow::Borrowed(label), None)
 }
 
-fn action_entry(
-    key: impl Into<String>,
-    label: &'static str,
-    action: NavigateAction,
-) -> HelpEntry {
+fn action_entry(key: impl Into<String>, label: &'static str, action: NavigateAction) -> HelpEntry {
     (key.into(), Cow::Borrowed(label), Some(action))
 }
 
@@ -181,7 +177,11 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             NavigateAction::NextAgent,
         ),
         info_entry(indexed_label(&kb.focus_agent), "focus agent 1-9"),
-        action_entry(keybind_label(&kb.new_tab), "new tab", NavigateAction::NewTab),
+        action_entry(
+            keybind_label(&kb.new_tab),
+            "new tab",
+            NavigateAction::NewTab,
+        ),
         action_entry(
             keybind_label(&kb.rename_tab),
             "rename tab",

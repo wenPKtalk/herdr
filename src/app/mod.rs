@@ -56,6 +56,13 @@ use crate::events::AppEvent;
 
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
+pub(crate) fn load_plugin_manifest(
+    path: &str,
+    enabled: bool,
+) -> Result<crate::api::schema::InstalledPluginInfo, (&'static str, String)> {
+    api::plugins::load_plugin_manifest(path, enabled)
+}
+
 /// Full application: AppState + runtime concerns (event channels, async I/O).
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayPaneState {
@@ -97,6 +104,7 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
+    pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
@@ -106,6 +114,7 @@ pub struct App {
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
+    pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
@@ -130,7 +139,7 @@ pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
 pub(crate) enum LoopEvent {
     Timer,
     Internal(AppEvent),
-    Api(crate::api::ApiRequestMessage),
+    Api(Box<crate::api::ApiRequestMessage>),
     RawInput(crate::raw_input::RawInputEvent),
     InputClosed,
     RenderRequested,
@@ -179,6 +188,20 @@ fn repeat_key_identity(
 
 fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
+}
+
+fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginRegistry {
+    if no_session {
+        return std::collections::HashMap::new();
+    }
+    let entries = crate::persist::plugin_registry::load();
+    let entries = crate::persist::plugin_registry::reload_manifests(entries, |path, enabled| {
+        crate::app::api::plugins::load_plugin_manifest(path, enabled).map_err(|(_, msg)| msg)
+    });
+    entries
+        .into_iter()
+        .map(|plugin| (plugin.plugin_id.clone(), plugin))
+        .collect()
 }
 
 fn agent_panel_scope_from_config(
@@ -397,10 +420,13 @@ impl App {
             state::Mode::Navigate
         };
 
+        let agent_manifest_summaries = crate::detect::manifest::reload_manifests();
+
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
+            public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
             active,
             previous_pane_focus: None,
@@ -482,6 +508,7 @@ impl App {
             update_dismissed: false,
             config_diagnostic,
             toast: None,
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code,
@@ -537,7 +564,14 @@ impl App {
                 original_theme: None,
             },
             integration_recommendations: crate::integration::integration_recommendations(),
+            agent_manifest_summaries,
+            agent_manifest_update_status: crate::detect::manifest_update::load_status(),
             integration_install_messages: Vec::new(),
+            installed_plugins: load_plugin_registry(no_session),
+            plugin_panes: std::collections::HashMap::new(),
+            plugin_command_logs: Vec::new(),
+            next_plugin_command_log_id: 1,
+            plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
@@ -559,6 +593,10 @@ impl App {
         if auto_updates_enabled(no_session) {
             let update_tx = event_tx.clone();
             std::thread::spawn(move || crate::update::auto_update(update_tx));
+            let manifest_update_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                crate::detect::manifest_update::auto_update(manifest_update_tx)
+            });
         }
 
         let last_focus = state.active.and_then(|idx| {
@@ -572,6 +610,7 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
+            last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
@@ -585,6 +624,8 @@ impl App {
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
             next_auto_update_check: auto_updates_enabled(no_session)
+                .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
+            next_agent_manifest_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
@@ -636,6 +677,15 @@ impl App {
         let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
 
         app.no_session = false;
+        if auto_updates_enabled(app.no_session) {
+            let now = Instant::now();
+            app.next_auto_update_check = app
+                .state
+                .update_available
+                .is_none()
+                .then_some(now + AUTO_UPDATE_CHECK_INTERVAL);
+            app.next_agent_manifest_update_check = Some(now + AUTO_UPDATE_CHECK_INTERVAL);
+        }
         app.state.detach_exits = false;
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
@@ -810,6 +860,10 @@ impl App {
                 needs_render = true;
             }
 
+            if self.ensure_default_workspace() {
+                needs_render = true;
+            }
+
             let now = Instant::now();
             self.sync_animation_timer(now);
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
@@ -871,7 +925,7 @@ impl App {
                 let input_rx = self.input_rx.as_mut();
                 tokio::select! {
                     maybe_api = self.api_rx.recv() => match maybe_api {
-                        Some(msg) => LoopEvent::Api(msg),
+                        Some(msg) => LoopEvent::Api(Box::new(msg)),
                         None => LoopEvent::Timer,
                     },
                     maybe_ev = self.event_rx.recv() => match maybe_ev {
@@ -894,7 +948,7 @@ impl App {
                     needs_render = true;
                 }
                 LoopEvent::Api(msg) => {
-                    if self.handle_api_request_message(msg) {
+                    if self.handle_api_request_message(*msg) {
                         needs_render = true;
                     }
                 }
@@ -936,6 +990,33 @@ impl App {
         }
         *active = desired;
         Ok(())
+    }
+
+    pub(crate) fn ensure_default_workspace(&mut self) -> bool {
+        if !self.state.workspaces.is_empty() || self.state.mode == Mode::Onboarding {
+            return false;
+        }
+
+        let previous_mode = self.state.mode;
+        let preserve_mode = matches!(
+            previous_mode,
+            Mode::ReleaseNotes | Mode::ProductAnnouncement | Mode::Settings
+        );
+        let cwd = self.resolve_new_terminal_cwd(None);
+
+        match self.create_workspace_with_options(cwd, true) {
+            Ok(_) => {
+                if preserve_mode {
+                    self.state.mode = previous_mode;
+                }
+                true
+            }
+            Err(err) => {
+                tracing::error!(err = %err, "failed to create default workspace");
+                self.state.mode = Mode::Navigate;
+                false
+            }
+        }
     }
 
     pub(crate) fn dismiss_release_notes(&mut self) {
@@ -1039,10 +1120,16 @@ impl App {
         for target in targets {
             let label = crate::integration::integration_target_label(target);
             match crate::integration::install_target(target) {
-                Ok(_) => self
-                    .state
-                    .integration_install_messages
-                    .push(format!("installed {label}")),
+                Ok(messages) => {
+                    self.state
+                        .integration_install_messages
+                        .push(format!("installed {label}"));
+                    self.state
+                        .integration_install_messages
+                        .extend(messages.into_iter().filter(|message| {
+                            message.starts_with(crate::integration::INSTALL_WARNING_PREFIX)
+                        }));
+                }
                 Err(err) => self
                     .state
                     .integration_install_messages
@@ -1237,6 +1324,7 @@ impl App {
                     kind: crate::app::state::ToastKind::UpdateInstalled,
                     title: "reloaded config".to_string(),
                     context: "using config.toml".to_string(),
+                    position: None,
                     target: None,
                 });
             }
@@ -1248,6 +1336,7 @@ impl App {
                     kind: crate::app::state::ToastKind::UpdateInstalled,
                     title: "reloaded config".to_string(),
                     context: "with warnings".to_string(),
+                    position: None,
                     target: None,
                 });
             }
@@ -1295,7 +1384,7 @@ impl App {
                                 self.handle_terminal_key_headless(key);
                             } else {
                                 self.suppressed_repeat_keys.insert(key_id);
-                                self.handle_non_terminal_key(key);
+                                self.handle_non_terminal_key_headless(key);
                             }
                         }
                         crossterm::event::KeyEventKind::Repeat => {
@@ -1321,7 +1410,9 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
-                    if self.state.mode == Mode::Terminal {
+                    if self.state.mode != Mode::Terminal {
+                        self.paste_into_active_text_input(&text);
+                    } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
                                 if let Some(focused) = ws.focused_pane_id() {
@@ -1364,8 +1455,17 @@ impl App {
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
     /// since the server doesn't have the async context of the monolithic App.
-    fn handle_non_terminal_key(&mut self, key: crate::input::TerminalKey) {
+    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
         let key_event = key.as_key_event();
+        if input::modal_paste_target_active(&self.state)
+            && input::is_modal_paste_shortcut(&key_event)
+        {
+            if let Some(text) = crate::platform::read_clipboard_text() {
+                self.paste_into_active_text_input(&text);
+            }
+            return;
+        }
+
         match self.state.mode {
             Mode::Prefix => {
                 self.handle_prefix_key(key);
@@ -1424,7 +1524,7 @@ impl App {
                 self.handle_settings_key(key_event);
             }
             Mode::Navigator => {
-                input::handle_navigator_key(&mut self.state, key_event);
+                input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.
@@ -1482,6 +1582,16 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[cfg(windows)]
+    fn exiting_test_command() -> &'static str {
+        "C:\\Windows\\System32\\whoami.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn exiting_test_command() -> &'static str {
+        "/usr/bin/true"
     }
 
     #[derive(Clone, Default)]
@@ -1708,12 +1818,26 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_feedback_can_be_disabled() {
+        let mut app = test_app();
+        app.state.toast_config.clipboard.enabled = false;
+
+        app.handle_internal_event(AppEvent::ClipboardWrite {
+            content: b"copied".to_vec(),
+        });
+
+        assert!(app.state.copy_feedback.is_none());
+        assert!(app.copy_feedback_deadline.is_none());
+    }
+
+    #[test]
     fn clipboard_feedback_does_not_replace_notification_toast() {
         let mut app = test_app();
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
             context: "background · 2".to_string(),
+            position: None,
             target: None,
         });
         let original_toast = app.state.toast.clone();
@@ -1730,6 +1854,172 @@ mod tests {
                 .map(|feedback| feedback.message.as_str()),
             Some("copied to clipboard")
         );
+    }
+
+    #[test]
+    fn notification_show_api_creates_herdr_toast_with_position() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: Some("api workspace".into()),
+                        position: Some(crate::config::ToastHerdrPosition::TopLeft),
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: true,
+                reason: crate::api::schema::NotificationShowReason::Shown,
+            }
+        );
+        let toast = app.state.toast.as_ref().expect("api toast");
+        assert_eq!(toast.title, "build failed");
+        assert_eq!(toast.context, "api workspace");
+        assert_eq!(
+            toast.position,
+            Some(crate::config::ToastHerdrPosition::TopLeft)
+        );
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[test]
+    fn notification_show_api_herdr_toast_expires() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: true,
+                reason: crate::api::schema::NotificationShowReason::Shown,
+            }
+        );
+        let deadline = app.toast_deadline.expect("api toast deadline");
+        assert!(app.handle_scheduled_tasks(deadline, false));
+        assert!(app.state.toast.is_none());
+        assert!(app.toast_deadline.is_none());
+    }
+
+    #[test]
+    fn notification_show_api_respects_off_delivery() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::Disabled,
+            }
+        );
+        assert!(app.state.toast.is_none());
+    }
+
+    #[test]
+    fn notification_show_api_does_not_replace_existing_toast() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "pi needs attention".to_string(),
+            context: "background · 2".to_string(),
+            position: None,
+            target: None,
+        });
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::Busy,
+            }
+        );
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.title.as_str()),
+            Some("pi needs attention")
+        );
+    }
+
+    #[test]
+    fn notification_show_api_is_rate_limited() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.mark_api_notification_shown(Instant::now());
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::RateLimited,
+            }
+        );
+        assert!(app.state.toast.is_none());
     }
 
     #[test]
@@ -2545,14 +2835,14 @@ mod tests {
             id: "req_2".into(),
             method: crate::api::schema::Method::WorkspaceFocus(
                 crate::api::schema::WorkspaceTarget {
-                    workspace_id: "w_1".into(),
+                    workspace_id: "w1".into(),
                 },
             ),
         };
         let pane_rename = crate::api::schema::Request {
             id: "req_3".into(),
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
-                pane_id: "w_1-1".into(),
+                pane_id: "w1:p1".into(),
                 label: Some("logs".into()),
             }),
         };
@@ -2568,12 +2858,40 @@ mod tests {
                 crate::api::schema::WorktreeCreateParams::default(),
             ),
         };
+        let pane_swap = crate::api::schema::Request {
+            id: "req_6".into(),
+            method: crate::api::schema::Method::PaneSwap(crate::api::schema::PaneSwapParams {
+                pane_id: Some("w1:p1".into()),
+                direction: Some(crate::api::schema::PaneDirection::Right),
+                ..crate::api::schema::PaneSwapParams::default()
+            }),
+        };
+        let pane_focus_direction = crate::api::schema::Request {
+            id: "req_7".into(),
+            method: crate::api::schema::Method::PaneFocusDirection(
+                crate::api::schema::PaneFocusDirectionParams {
+                    pane_id: Some("w1:p1".into()),
+                    direction: crate::api::schema::PaneDirection::Right,
+                },
+            ),
+        };
+        let pane_resize = crate::api::schema::Request {
+            id: "req_8".into(),
+            method: crate::api::schema::Method::PaneResize(crate::api::schema::PaneResizeParams {
+                pane_id: Some("w1:p1".into()),
+                direction: crate::api::schema::PaneDirection::Right,
+                amount: Some(0.05),
+            }),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
         assert!(crate::api::request_changes_ui(&mutating));
         assert!(crate::api::request_changes_ui(&pane_rename));
         assert!(crate::api::request_changes_ui(&worktree_create));
+        assert!(crate::api::request_changes_ui(&pane_swap));
+        assert!(crate::api::request_changes_ui(&pane_focus_direction));
+        assert!(crate::api::request_changes_ui(&pane_resize));
     }
 
     #[test]
@@ -2623,6 +2941,61 @@ mod tests {
     }
 
     #[test]
+    fn tab_info_number_uses_stable_public_tab_number() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("api-tab-public-number");
+        let removed_tab = workspace.test_add_tab(None);
+        let survivor_tab = workspace.test_add_tab(None);
+        let survivor_pane = workspace.tabs[survivor_tab].root_pane;
+        assert!(workspace.close_tab(removed_tab));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let survivor_idx = app.state.workspaces[0]
+            .find_tab_index_for_pane(survivor_pane)
+            .unwrap();
+
+        let tab = app.tab_info(0, survivor_idx).unwrap();
+
+        assert_eq!(tab.tab_id, format!("{}:t3", app.state.workspaces[0].id));
+        assert_eq!(tab.number, 3);
+        assert_eq!(tab.label, "2");
+    }
+
+    #[test]
+    fn legacy_bare_tab_id_uses_tab_position_not_public_tab_number() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("legacy-tab-id");
+        let removed_tab = workspace.test_add_tab(None);
+        workspace.test_add_tab(None);
+        let public_four_tab = workspace.test_add_tab(None);
+        let fourth_position_tab = workspace.test_add_tab(None);
+        let public_four_pane = workspace.tabs[public_four_tab].root_pane;
+        let fourth_position_pane = workspace.tabs[fourth_position_tab].root_pane;
+        assert!(workspace.close_tab(removed_tab));
+        app.state.workspaces = vec![workspace];
+
+        let public_four_idx = app.state.workspaces[0]
+            .find_tab_index_for_pane(public_four_pane)
+            .unwrap();
+        let fourth_position_idx = app.state.workspaces[0]
+            .find_tab_index_for_pane(fourth_position_pane)
+            .unwrap();
+
+        assert_eq!(app.state.workspaces[0].tabs[public_four_idx].number, 4);
+        assert_eq!(app.state.workspaces[0].tabs[fourth_position_idx].number, 5);
+        assert_eq!(
+            app.parse_tab_id(&format!("{}:t4", app.state.workspaces[0].id)),
+            Some((0, public_four_idx))
+        );
+        assert_eq!(
+            app.parse_tab_id(&format!("{}:4", app.state.workspaces[0].id)),
+            Some((0, fourth_position_idx))
+        );
+    }
+
+    #[test]
     fn workspace_creation_in_navigate_mode_uses_selected_workspace_seed_cwd() {
         let mut app = test_app();
         let mut first = Workspace::test_new("herdr");
@@ -2650,6 +3023,18 @@ mod tests {
         );
 
         assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-source"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_follow_without_source_uses_home() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+
+        let cwd =
+            creation::resolve_new_terminal_cwd(&crate::config::NewTerminalCwdConfig::Follow, None);
+
+        assert_eq!(cwd, home);
     }
 
     #[test]
@@ -2865,7 +3250,7 @@ mod tests {
     async fn pane_split_request_targets_pane_in_background_tab() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-pane-split-background-tab");
@@ -2902,10 +3287,12 @@ mod tests {
             id: "req_pane_split_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
-                target_pane_id,
+                target_pane_id: Some(target_pane_id),
                 direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
                 cwd: None,
                 focus: false,
+                env: Default::default(),
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2961,7 +3348,7 @@ mod tests {
     async fn pane_split_request_focuses_new_pane_when_requested() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-pane-split-focus-background-tab");
@@ -2980,10 +3367,12 @@ mod tests {
             id: "req_pane_split_focus_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
-                target_pane_id,
+                target_pane_id: Some(target_pane_id),
                 direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
                 cwd: None,
                 focus: true,
+                env: Default::default(),
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2993,6 +3382,99 @@ mod tests {
         assert_eq!(response["result"]["pane"]["focused"], true);
         assert_eq!(app.state.active, Some(0));
         assert_eq!(app.state.workspaces[0].active_tab, background_tab);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_split_request_applies_ratio() {
+        let _guard = config_env_lock().lock().unwrap();
+        let original_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/usr/bin/true");
+
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-split-ratio");
+        let target_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_split_ratio".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(target_pane_id),
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: Some(0.333),
+                cwd: None,
+                focus: false,
+                env: Default::default(),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        let splits = app.state.workspaces[0].tabs[0]
+            .layout
+            .splits(ratatui::layout::Rect::new(0, 0, 100, 20));
+        assert_eq!(splits.len(), 1);
+        assert!((splits[0].ratio - 0.333).abs() < f32::EPSILON);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_split_request_uses_active_focused_pane_when_target_is_omitted() {
+        let _guard = config_env_lock().lock().unwrap();
+        let original_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/usr/bin/true");
+
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-split-current");
+        let target_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.focus_pane_in_workspace(0, target_pane);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_split_current".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: None,
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                env: Default::default(),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.focused(),
+            target_pane
+        );
 
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
@@ -3023,7 +3505,8 @@ mod tests {
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
                 focus: true,
-                argv: vec!["/usr/bin/true".into()],
+                argv: vec![exiting_test_command().into()],
+                env: Default::default(),
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3271,7 +3754,6 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             visible_blocker: false,
-            visible_idle: false,
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
@@ -3296,7 +3778,6 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             visible_blocker: false,
-            visible_idle: false,
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
@@ -3499,6 +3980,15 @@ last_pane = "prefix+tab"
         app.route_client_input(b"\x1b[99;5u".to_vec());
 
         assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from(vec![3]));
+
+        // iTerm2 and rxvt-style hosts may send F4 as CSI 14~. Normalize it
+        // through the same semantic key path instead of leaking host bytes.
+        app.route_client_input(b"\x1b[14~".to_vec());
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1bOS")
+        );
     }
 
     #[tokio::test]
@@ -3617,6 +4107,68 @@ last_pane = "prefix+tab"
         assert_eq!(
             app.state.settings.section,
             state::SettingsSection::Integrations
+        );
+    }
+
+    #[test]
+    fn route_client_input_pastes_bracketed_text_into_rename_modal() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::RenameTab;
+        app.state.name_input = "2".into();
+        app.state.name_input_replace_on_type = true;
+
+        app.route_client_input(b"\x1b[200~feature/logs\x1b[201~".to_vec());
+
+        assert_eq!(app.state.name_input, "feature/logs");
+        assert!(!app.state.name_input_replace_on_type);
+    }
+
+    #[test]
+    fn raw_ctrl_v_decodes_as_modal_paste_shortcut() {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(&[0x16]);
+        let Some(crate::raw_input::RawInputEvent::Key(key)) = events.first() else {
+            panic!("expected ctrl-v key event");
+        };
+
+        assert!(input::is_modal_paste_shortcut(&key.as_key_event()));
+    }
+
+    #[test]
+    fn route_client_events_pastes_text_into_new_linked_worktree_modal() {
+        let mut app = test_app();
+        app.state.mode = Mode::NewLinkedWorktree;
+        app.state.name_input = "generated-branch".into();
+        app.state.name_input_replace_on_type = true;
+        app.state.worktree_create = Some(state::WorktreeCreateState {
+            source_workspace_id: "source".into(),
+            source_checkout_path: "/repo/herdr".into(),
+            source_existing_membership: None,
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            branch: "generated-branch".into(),
+            checkout_path: "/repo/herdr-generated-branch".into(),
+            error: None,
+            creating: false,
+        });
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste(
+                "feature/linear-302".into(),
+            )],
+            true,
+        );
+
+        assert_eq!(app.state.name_input, "feature/linear-302");
+        assert_eq!(
+            app.state
+                .worktree_create
+                .as_ref()
+                .map(|create| create.branch.as_str()),
+            Some("feature/linear-302")
         );
     }
 

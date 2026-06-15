@@ -57,6 +57,14 @@ pub struct WorkspaceSnapshot {
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
+    #[serde(default)]
+    pub public_pane_numbers: HashMap<u32, usize>,
+    #[serde(default)]
+    pub next_public_pane_number: usize,
+    #[serde(default)]
+    pub public_tab_numbers: Vec<usize>,
+    #[serde(default)]
+    pub next_public_tab_number: usize,
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
@@ -150,6 +158,10 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
+            public_pane_numbers: HashMap::new(),
+            next_public_pane_number: 0,
+            public_tab_numbers: Vec::new(),
+            next_public_tab_number: 0,
             tabs: vec![tab],
             active_tab: 0,
         }
@@ -284,6 +296,14 @@ fn capture_workspace(
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
         worktree_space: ws.worktree_space.clone(),
+        public_pane_numbers: ws
+            .public_pane_numbers
+            .iter()
+            .map(|(pane_id, number)| (pane_id.raw(), *number))
+            .collect(),
+        next_public_pane_number: ws.next_public_pane_number,
+        public_tab_numbers: ws.tabs.iter().map(|tab| tab.number).collect(),
+        next_public_tab_number: ws.next_public_tab_number,
         tabs: ws
             .tabs
             .iter()
@@ -488,6 +508,14 @@ mod tests {
         }
     }
 
+    fn test_session_path(name: &str) -> String {
+        std::env::current_dir()
+            .unwrap()
+            .join(name)
+            .display()
+            .to_string()
+    }
+
     fn state_with_workspaces(names: &[&str]) -> AppState {
         let mut state = AppState::test_new();
         state.workspaces = names.iter().map(|name| Workspace::test_new(name)).collect();
@@ -608,6 +636,10 @@ mod tests {
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
+                public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
+                next_public_pane_number: 3,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
@@ -878,7 +910,9 @@ mod tests {
     #[test]
     fn capture_contract_tracks_resize_ratio_changes() {
         let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
         state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut state, Rect::new(0, 0, 106, 20));
         let before = capture_from_state(&state);
 
@@ -917,6 +951,30 @@ mod tests {
         assert_eq!(tab.panes.len(), 1);
         assert!(matches!(tab.layout, LayoutSnapshot::Pane(_)));
         assert!(!tab.zoomed);
+    }
+
+    #[test]
+    fn capture_contract_tracks_public_id_counters() {
+        let mut state = state_with_workspaces(&["one"]);
+        let second = state.workspaces[0].test_split(Direction::Horizontal);
+        let third = state.workspaces[0].test_split(Direction::Vertical);
+        let second_tab = state.workspaces[0].test_add_tab(None);
+
+        state.workspaces[0].close_pane(second);
+
+        let snapshot = capture_from_state(&state);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(
+            workspace.public_pane_numbers,
+            HashMap::from([
+                (state.workspaces[0].tabs[0].root_pane.raw(), 1),
+                (third.raw(), 3),
+                (state.workspaces[0].tabs[second_tab].root_pane.raw(), 4),
+            ])
+        );
+        assert_eq!(workspace.next_public_pane_number, 5);
+        assert_eq!(workspace.public_tab_numbers, vec![1, 2]);
+        assert_eq!(workspace.next_public_tab_number, 3);
     }
 
     #[test]
@@ -1022,6 +1080,7 @@ mod tests {
     #[test]
     fn capture_contract_tracks_hook_authority_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
+        let session_path = test_session_path("pi-session.jsonl");
         let root = state.workspaces[0].tabs[0].root_pane;
         state.ensure_test_terminals();
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
@@ -1037,7 +1096,7 @@ mod tests {
                 crate::detect::AgentState::Working,
                 None,
                 None,
-                crate::agent_resume::AgentSessionRef::path("/tmp/pi-session.jsonl"),
+                crate::agent_resume::AgentSessionRef::path(session_path.clone()),
                 Some(20),
             );
 
@@ -1053,7 +1112,7 @@ mod tests {
             agent_session.kind,
             crate::agent_resume::AgentSessionRefKind::Path
         );
-        assert_eq!(agent_session.value, "/tmp/pi-session.jsonl");
+        assert_eq!(agent_session.value, session_path);
     }
 
     #[test]
@@ -1142,6 +1201,10 @@ mod tests {
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Split {

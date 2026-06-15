@@ -140,6 +140,9 @@ impl App {
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
+            crate::config::CustomCommandAction::PluginAction => self
+                .invoke_plugin_action_from_keybind(binding.command.clone())
+                .map_err(std::io::Error::other),
         };
         match result {
             Ok(()) => finish_custom_command_context(&mut self.state, context, previous_mode),
@@ -148,6 +151,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "custom command failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -229,6 +233,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "edit scrollback failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -271,6 +276,7 @@ impl App {
                 kind: crate::app::state::ToastKind::Finished,
                 title: "opened scrollback".to_string(),
                 context: format!("focused pane {public_pane_id}"),
+                position: None,
                 target: None,
             });
         }
@@ -314,7 +320,7 @@ impl App {
             new_cols,
             cwd,
             command,
-            &env,
+            env,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
         )?;
@@ -351,6 +357,92 @@ impl App {
         self.state.remove_alias_shadowed_by_new_pane(new_pane_id);
         self.state.mode = Mode::Terminal;
         Ok(())
+    }
+
+    pub(crate) fn spawn_overlay_argv_command(
+        &mut self,
+        argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        let Some(ws_idx) = self.state.active else {
+            return Err(std::io::Error::other("no active workspace"));
+        };
+        let previous_focus_target = self.state.current_pane_focus_target();
+        let (rows, cols) = self.state.estimate_pane_size();
+        let new_rows = rows.max(4);
+        let new_cols = cols.max(10);
+
+        let ws = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        let previous_focus = ws
+            .focused_pane_id()
+            .ok_or_else(|| std::io::Error::other("no focused pane"))?;
+        let cwd = cwd.or_else(|| {
+            ws.active_tab().and_then(|tab| {
+                tab.cwd_for_pane(
+                    previous_focus,
+                    &self.state.terminals,
+                    &self.terminal_runtimes,
+                )
+            })
+        });
+
+        let (tab_idx, new_pane, workspace_id) = {
+            let ws = self
+                .state
+                .workspaces
+                .get_mut(ws_idx)
+                .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+            let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
+            let result = ws.split_pane_argv_command(
+                previous_focus,
+                Direction::Horizontal,
+                new_rows,
+                new_cols,
+                cwd,
+                argv,
+                extra_env,
+                self.state.pane_scrollback_limit_bytes,
+                self.state.host_terminal_theme,
+                true,
+            );
+            let (tab_idx, new_pane) = match result {
+                Some(Ok(result)) => result,
+                Some(Err(err)) => return Err(err),
+                None => return Err(std::io::Error::other("focused pane disappeared")),
+            };
+            ws.tabs
+                .get_mut(tab_idx)
+                .ok_or_else(|| std::io::Error::other("plugin overlay tab disappeared"))?
+                .zoomed = true;
+            self.overlay_panes.insert(
+                new_pane.pane_id,
+                super::super::OverlayPaneState {
+                    ws_idx,
+                    tab_idx,
+                    previous_focus,
+                    previous_zoomed,
+                    temp_files,
+                },
+            );
+            (tab_idx, new_pane, ws.id.clone())
+        };
+
+        let new_focus_target = crate::app::state::PaneFocusTarget {
+            workspace_id,
+            pane_id: new_pane.pane_id,
+        };
+        if previous_focus_target.as_ref() != Some(&new_focus_target) {
+            self.state.previous_pane_focus = previous_focus_target;
+        }
+        self.state.switch_workspace_tab(ws_idx, tab_idx);
+        self.state.mode = Mode::Terminal;
+        Ok((ws_idx, new_pane))
     }
 }
 
@@ -499,6 +591,10 @@ pub(crate) enum NavigateAction {
     FocusPaneDown,
     FocusPaneUp,
     FocusPaneRight,
+    SwapPaneLeft,
+    SwapPaneDown,
+    SwapPaneUp,
+    SwapPaneRight,
     SplitVertical,
     SplitHorizontal,
     ClosePane,
@@ -601,6 +697,10 @@ fn action_for_key(
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
         (&kb.focus_pane_up, NavigateAction::FocusPaneUp),
         (&kb.focus_pane_right, NavigateAction::FocusPaneRight),
+        (&kb.swap_pane_left, NavigateAction::SwapPaneLeft),
+        (&kb.swap_pane_down, NavigateAction::SwapPaneDown),
+        (&kb.swap_pane_up, NavigateAction::SwapPaneUp),
+        (&kb.swap_pane_right, NavigateAction::SwapPaneRight),
         (&kb.last_pane, NavigateAction::LastPane),
         (&kb.cycle_pane_next, NavigateAction::CyclePaneNext),
         (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
@@ -778,6 +878,22 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::FocusPaneDown => state.navigate_pane(NavDirection::Down),
         NavigateAction::FocusPaneUp => state.navigate_pane(NavDirection::Up),
         NavigateAction::FocusPaneRight => state.navigate_pane(NavDirection::Right),
+        NavigateAction::SwapPaneLeft => {
+            state.swap_pane(NavDirection::Left);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneDown => {
+            state.swap_pane(NavDirection::Down);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneUp => {
+            state.swap_pane(NavDirection::Up);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneRight => {
+            state.swap_pane(NavDirection::Right);
+            leave_navigate_mode(state);
+        }
         NavigateAction::SplitVertical => {
             state.split_pane(terminal_runtimes, Direction::Horizontal);
             leave_navigate_mode(state);
@@ -830,7 +946,7 @@ pub(super) fn execute_navigate_action_in_context(
             super::modal::request_detach(state);
             leave_navigate_mode(state);
         }
-        NavigateAction::OpenNavigator => state.open_navigator(),
+        NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -961,12 +1077,15 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
 
-    use super::super::{state_with_workspaces, unique_temp_path, wait_for_file};
+    #[cfg(unix)]
+    use super::super::wait_for_file;
+    use super::super::{state_with_workspaces, unique_temp_path};
     use super::*;
     use crate::{
         app::App, config::Config, input::TerminalKey, terminal::TerminalState, workspace::Workspace,
@@ -1271,6 +1390,7 @@ mod tests {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".into(),
             context: "two".into(),
+            position: None,
             target: Some(crate::app::state::ToastTarget {
                 workspace_id: target_workspace_id,
                 pane_id: target_pane,
@@ -1498,6 +1618,19 @@ navigate_pane_right = "ctrl+l"
         );
 
         assert_eq!(action, Some(NavigateAction::FocusPaneLeft));
+    }
+
+    #[test]
+    fn terminal_direct_swap_pane_shortcut_maps_to_navigation_action() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds.swap_pane_right = crate::config::ActionKeybinds::direct("alt+shift+l");
+
+        let action = terminal_direct_navigation_action(
+            &state,
+            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Some(NavigateAction::SwapPaneRight));
     }
 
     #[test]
@@ -1788,11 +1921,11 @@ last_pane = "prefix+tab"
     #[test]
     fn modified_navigate_local_key_can_be_bound_as_prefix_rhs() {
         let mut state = state_with_workspaces(&["test"]);
-        state.keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("shift+h");
+        state.keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("shift+u");
 
         handle_navigate_key(
             &mut state,
-            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT),
         );
 
         assert!(state.sidebar_collapsed);
@@ -1856,6 +1989,7 @@ last_pane = "prefix+tab"
         assert_eq!(state.workspaces.len(), 2);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn custom_command_runs_from_prefix_key_in_navigate_mode() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1898,13 +2032,14 @@ last_pane = "prefix+tab"
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], app.state.workspaces[0].id);
-        assert_eq!(lines[1], format!("{}:1", app.state.workspaces[0].id));
-        assert_eq!(lines[2], format!("{}-1", app.state.workspaces[0].id));
+        assert_eq!(lines[1], format!("{}:t1", app.state.workspaces[0].id));
+        assert_eq!(lines[2], format!("{}:p1", app.state.workspaces[0].id));
         assert_eq!(app.state.mode, Mode::Terminal);
 
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pane_overlay_command_opens_and_closes_after_exit() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1992,6 +2127,7 @@ last_pane = "prefix+tab"
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn edit_scrollback_key_opens_focused_runtime_scrollback_in_editor_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

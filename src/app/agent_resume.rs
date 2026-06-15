@@ -223,6 +223,12 @@ impl App {
             );
             return false;
         };
+        let Some(launch_env) = self
+            .find_pane(pane_id)
+            .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, Vec::new()))
+        else {
+            return false;
+        };
 
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
@@ -232,6 +238,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -339,6 +346,7 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -350,6 +358,21 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn long_running_test_argv() -> Vec<String> {
+        vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]
+    }
+
+    #[cfg(unix)]
+    fn marker_resume_test_argv() -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' 'restored agent: shell quoted | marker'; sleep 5".into(),
+        ]
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn pending_agent_resume_waits_for_host_theme_before_launch() {
         let mut app = test_app();
@@ -371,11 +394,7 @@ mod tests {
             .expect("test terminal should exist");
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "printf '%s' 'restored agent: shell quoted | marker'; sleep 5".into(),
-            ],
+            argv: marker_resume_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
@@ -432,6 +451,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pending_agent_resume_can_launch_after_theme_wait_expires() {
         let mut app = test_app();
@@ -451,7 +471,7 @@ mod tests {
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
@@ -465,6 +485,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn pending_agent_resume_launches_hidden_panes_with_current_terminal_area() {
         let mut app = test_app();
@@ -500,7 +521,7 @@ mod tests {
                 .expect("test terminal should exist")
                 .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
                 agent: "codex".into(),
-                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+                argv: long_running_test_argv(),
                 dedupe_key: format!("herdr:codex\0codex\0Id\0{terminal_id}"),
             });
         }
@@ -520,6 +541,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn pending_agent_resume_launches_inactive_tab_panes_with_current_terminal_area() {
         let mut app = test_app();
@@ -562,7 +584,7 @@ mod tests {
             .expect("inactive tab terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
         });
 
@@ -583,6 +605,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn pending_agent_resume_launches_zoom_hidden_active_tab_panes() {
         let mut app = test_app();
@@ -620,7 +643,7 @@ mod tests {
             .expect("hidden zoom pane terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
         });
 
@@ -641,6 +664,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn pending_agent_resume_uses_current_terminal_area_for_background_panes() {
         let mut app = test_app();
@@ -676,7 +700,7 @@ mod tests {
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
@@ -699,6 +723,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pending_agent_resume_launches_with_inner_rect_size() {
         let mut app = test_app();
@@ -734,7 +759,7 @@ mod tests {
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
