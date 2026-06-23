@@ -19,10 +19,14 @@ pub const PROTOCOL_VERSION: u32 = 14;
 /// rejected to prevent denial-of-service via oversized length prefixes.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
-/// Maximum allowed server-to-client frame payload when Kitty graphics are enabled.
-/// Normal traffic keeps `MAX_FRAME_SIZE`; this larger cap is only for explicit
-/// image payloads that are naturally much larger after base64 encoding.
-pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
+/// Maximum allowed large-frame payload. Used for server-to-client Kitty
+/// graphics frames (image payloads, naturally large after base64 encoding) and
+/// as the umbrella ceiling for client-to-server frames, which can carry large
+/// pastes up to `MAX_INPUT_PAYLOAD`. Kept strictly above `MAX_INPUT_PAYLOAD`
+/// (with headroom for framing overhead) so the input-size limit is what an
+/// oversized paste hits, not this generic framing ceiling. Normal traffic keeps
+/// `MAX_FRAME_SIZE`.
+pub const MAX_GRAPHICS_FRAME_SIZE: usize = 256 * 1024 * 1024;
 
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;

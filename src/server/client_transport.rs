@@ -36,7 +36,7 @@ const MIN_CLIENT_ROWS: u16 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
-const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
+const MAX_INPUT_PAYLOAD: usize = 128 * 1024 * 1024; // 128 MB
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 
